@@ -15,6 +15,18 @@ export default function Home() {
       <h1>ApproveFlow</h1>
       <p>Request. Approve. Audit.</p>
       <p>All from Slack.</p>
+      <a
+        href="/api/slack/install"
+        style={{
+          marginTop: "1rem",
+          padding: "0.6rem 1.2rem",
+          borderRadius: "6px",
+          background: "#4A154B",
+          color: "#fff",
+        }}
+      >
+        Add to Slack
+      </a>
     </main>
   );
 }

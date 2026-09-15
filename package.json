@@ -6,9 +6,13 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "test": "node --experimental-strip-types --test"
   },
   "dependencies": {
+    "@slack/oauth": "^4.0.0",
+    "@slack/web-api": "^8.1.1",
+    "@supabase/supabase-js": "^2.116.0",
     "next": "16.3.5",
     "react": "19.2.8",
     "react-dom": "19.2.8",
