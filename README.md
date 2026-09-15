@@ -8,9 +8,24 @@ audit trail. Later milestones may integrate with AWS, GitHub, Supabase
 auth providers, and Google Workspace to automatically grant/revoke
 temporary access.
 
-## Current milestone: M5 — Slack Request History & Request Details
+## Current milestone: M6 — Slack App Home
 
-M5 adds `/requests`: a way to see your ApproveFlow activity without leaving
+M6 adds a persistent **App Home** tab: a front door over the existing
+product, not a second one. Opening the Home tab shows a short intro, a
+**Create Request** button, an **Open Request Center** button, a "My
+Requests" summary (your 3 most recent, since Home is a summary — the full
+list is still `/requests`), and a "Waiting for Me" summary (a count + button,
+or "Nothing is waiting for your approval." when there's nothing to decide).
+Every one of those four actions reuses the exact M2–M5 modal
+builders/queries/decision path unchanged — Home only adds a new entry point
+and a new Slack Events API endpoint (`/api/slack/events`) that listens for
+`app_home_opened` and republishes the tab. No web dashboard, no login, no
+new Slack scopes, no database migration. See [M6: App Home
+architecture](#m6-app-home-architecture) below.
+
+## Previously: M5 — Slack Request History & Request Details
+
+M5 added `/requests`: a way to see your ApproveFlow activity without leaving
 Slack. Running it opens a modal with two sections — **My Requests** (what
 you've submitted) and **Waiting for Me** (pending requests you're currently
 authorized to decide). Opening any request shows its full details, and if
@@ -45,11 +60,12 @@ automatically uses that policy instead of the manually selected approver.
 Policy routing always takes precedence — a requester's pick can never
 override configured company policy.
 
-**Still NOT implemented:** a web admin dashboard, App Home, an audit event
-system, automatic access provisioning/revocation (AWS/GitHub/etc.), billing,
-rejection-reason modals, escalation, reminders, channel-based approval,
-multiple manually-selected approvers, or user authentication. Those belong
-to M5 and later.
+**Still NOT implemented:** a web admin dashboard, web authentication,
+ADMIN/MEMBER roles, policy/request-type configuration UI, request
+cancellation/editing, approval comments, rejection reasons, reminders,
+escalations, scheduled jobs, email, billing, an audit event system,
+automatic access provisioning/revocation (AWS/GitHub/etc.), AI, Home
+personalization/settings, or an onboarding wizard.
 
 ## Prerequisites
 
@@ -204,10 +220,21 @@ reinstall. Reinstalling is safe: the OAuth callback upserts by
 `slack_team_id`, so it updates the existing `workspaces` row (with the new
 scope's token) rather than creating a duplicate.
 
+**M6 adds no new scope either.** `views.publish` (used to render the App
+Home tab) is documented as requiring no additional scope beyond what an
+installed bot token already has — verified against Slack's current API
+reference before implementing, the same way M4's `users_select` scope check
+was done. The Events API subscription for `app_home_opened` is a Slack app
+*configuration* change (Event Subscriptions → Subscribe to bot events), not
+an OAuth scope, so it requires no reinstall — existing installations start
+getting `app_home_opened` events as soon as the event is enabled on the app
+and the Request URL is verified.
+
 ## Slack request verification
 
-Every request to `/api/slack/commands/request` and `/api/slack/interactions`
-is verified using Slack's [signing secret protocol](https://docs.slack.dev/authentication/verifying-requests-from-slack)
+Every request to `/api/slack/commands/request`, `/api/slack/commands/requests`,
+`/api/slack/interactions`, and `/api/slack/events` (M6) is verified using
+Slack's [signing secret protocol](https://docs.slack.dev/authentication/verifying-requests-from-slack)
 before the body is parsed or trusted in any way:
 
 1. Read the exact raw request body (`request.text()` — never parsed and
@@ -219,8 +246,12 @@ before the body is parsed or trusted in any way:
 
 This lives in `src/lib/slack/verify-request.ts` as a pure function (see
 `verify-request.test.ts`) — no framework, no extra dependency, just Node's
-built-in `crypto`. Only after this passes does either route parse the form
-body / `payload` field.
+built-in `crypto`. Only after this passes does any route parse the form
+body / `payload` field / event JSON. Confirmed against Slack's current docs
+before building M6: the Events API uses this exact same v0 HMAC scheme, so
+`isValidSlackRequest` is reused as-is for `/api/slack/events` — including
+for the one-time `url_verification` handshake request, which Slack signs
+like any other event. There is no unsigned bypass for that handshake.
 
 ## M2 Slack configuration: slash command and interactivity
 
@@ -279,6 +310,39 @@ Same considerations as OAuth in M1: set `NEXT_PUBLIC_APP_URL` to your real
 Vercel domain, register the two Request URLs there, and be aware preview
 deployments get unique URLs that won't match what's registered.
 
+## M6 Slack configuration: App Home and Events API
+
+Manual steps in the Slack app dashboard (same app as above) — nothing here
+is automated, and I have not modified your Slack app configuration myself.
+
+1. **Features → App Home**:
+   - Turn **Home Tab** **On**.
+   - Leave **Messages Tab** as-is (this app doesn't use it).
+2. **Features → Event Subscriptions**:
+   - Turn **Enable Events** **On**.
+   - Request URL: `<APP_URL>/api/slack/events` — Slack will immediately send
+     a `url_verification` request to this URL and expects the exact
+     `challenge` value echoed back within a few seconds; the app only does
+     this after verifying the request's signature (see [Slack request
+     verification](#slack-request-verification) above), so make sure
+     `SLACK_SIGNING_SECRET` is already set wherever this URL is reachable
+     before you paste it in, or verification will fail and Slack will
+     refuse to save the URL.
+   - Under **Subscribe to bot events**, add `app_home_opened`.
+   - Save.
+3. Bot Token Scopes (**OAuth & Permissions**) should already include
+   `commands` and `chat:write` from M1/M3 — **no new scope is needed for
+   M6**. `views.publish`'s own reference documentation states no scope is
+   required beyond an installed bot token, verified directly before
+   implementing (same check as M2 did for `views.push`/`views.open`).
+   Enabling Event Subscriptions and adding a bot event subscription is an
+   app **configuration** change, not an OAuth grant, so **no reinstall is
+   required** for existing installations — they start receiving
+   `app_home_opened` events as soon as this is saved.
+4. Same [tunnel requirement as M2](#slack-cannot-call-localhost--local-development-options)
+   applies to the Events Request URL for local development — Slack cannot
+   reach `http://localhost:3000` directly.
+
 ## Local vs. production architecture
 
 Every route is a stateless Next.js Route Handler: no persistent Node
@@ -293,6 +357,19 @@ the request is inserted, using `Promise.allSettled` so one approver's
 delivery failure doesn't block or fail the others. This runs as-is on
 Vercel serverless functions with no architectural changes between local and
 production.
+
+**M6's `/api/slack/events` follows the exact same synchronous pattern** —
+no queue, no `waitUntil`/`after()`, nothing pretending background work is
+durable when Vercel doesn't guarantee it. Handling `app_home_opened` is:
+verify signature → 2 small indexed queries (3 most recent requests, 1
+waiting-for-me count) → build the view → 1 `views.publish` call → ack. That
+comfortably fits inside Slack's ~3-second ack window, same as every other
+route in this app, so introducing a queue/worker for M6 would have been
+unwarranted complexity for a read-mostly, deterministic query path. A
+redelivered event (Slack retries on non-200/timeout) just republishes the
+same Home view again — `views.publish` always replaces the previous view
+wholesale, so a duplicate delivery is a harmless no-op, not a duplicate side
+effect the way a second notification DM would be.
 
 ## Approval policy configuration (optional, M3)
 
@@ -782,6 +859,123 @@ authoritative display label from M2 — no hardcoded key→label map).
 Timestamps use Slack's `<!date^...>` token so each viewer sees their own
 timezone, with a plain-text fallback.
 
+## M6: App Home architecture
+
+### Why an Events API endpoint, not a slash command
+
+Home is *pushed* to a user by Slack whenever they open the tab — it isn't
+requested via a command, so it needs an endpoint that receives Slack Events
+API callbacks. This is a genuinely new Slack surface (M1–M5 only ever used
+slash commands and interactivity), so it lives in its own route,
+`/api/slack/events`, rather than being folded into `/api/slack/interactions`
+— the two payload shapes (`event_callback` envelopes vs. `block_actions`/
+`view_submission` payloads) are unrelated, and mixing them would make one
+handler do two jobs.
+
+### The event envelope and `url_verification`
+
+Slack's Events API wraps every delivery in an outer envelope:
+`{type: "url_verification", challenge, token}` once, when you first save the
+Request URL, or `{type: "event_callback", team_id, event: {...}, ...}` for
+every real event after that. `src/lib/slack/parse-slack-event.ts` is a pure
+classifier (unit tested) that turns a signature-verified envelope into
+exactly one of three outcomes: `url_verification` (echo the challenge back),
+`app_home_opened` (only when `event.tab === "home"` — a `messages` tab open
+is a different event value on the same event type and must **never**
+republish Home), or `ignored` (any other event type, or a malformed/
+incomplete envelope) — never throws.
+
+### `app_home_opened` handling
+
+For an accepted `app_home_opened`, `/api/slack/events`:
+
+1. Resolves the workspace via `findWorkspaceBySlackTeamId(team_id)` — if
+   `null` (uninstalled, or an event for a team this app has never seen),
+   acks with 200 and does nothing else. There's nothing to publish to, and
+   returning non-200 would just cause Slack to retry a request that can
+   never succeed.
+2. Upserts the Slack user (`upsertSlackUser`, the same idempotent M2
+   helper every other route uses) — Home must work for a user who has never
+   run a command before.
+3. Runs `listRequestsByRequester(workspace.id, viewer.id, 3)` and
+   `listRequestsWaitingForApprover(workspace.id, viewer.id)` in parallel —
+   the **exact same M5 functions**, just called with a smaller limit for the
+   first one (see below).
+4. Builds the view with `buildAppHomeView` and publishes it with
+   `client.views.publish({ user_id, view })`.
+5. Any failure past step 1 is caught, logged (message only — never the bot
+   token or raw API response), and still acks 200, matching every other
+   route's error-handling convention in this app.
+
+### Reusing M5's queries, not re-deriving them
+
+`listRequestsByRequester` (`src/lib/requests/request-views.ts`) gained one
+new optional parameter: `limit`, defaulting to the existing M5 constant
+(`10`) so `/requests`'s behavior is completely unchanged. Home passes `3`.
+The scoping (`workspace_id` **and** `requester_id` together, newest-first)
+and the query shape are identical either way — this is the same function,
+not a second one. `listRequestsWaitingForApprover` needed **no changes at
+all**: Home's "Waiting for Me" count is just `waitingRequests.length` from
+the same DIRECT/POLICY live-membership-aware query M5 already uses, so a
+policy member who's already decided, or been removed from a policy, is
+excluded from Home's count exactly as they are from the Request Center's.
+
+### The four Home actions — reuse, not a second system
+
+| Home action | Action ID | Reuses |
+| --- | --- | --- |
+| **Create Request** | `create_request_home` (new) | `ensureDefaultRequestTypes` + `listActiveRequestTypes` + `buildRequestModal` — identical bootstrap to `/request`, including a freshly generated `idempotencyKey` |
+| **Open Request Center** | `open_request_center` (new) | `listRequestsByRequester` (default limit 10) + `listRequestsWaitingForApprover` + `buildRequestCenterView` — identical to `/requests` |
+| **View** (a My Requests row) | `view_request` (M5, unchanged) | `getRequestDetails` + `buildRequestDetailsView` |
+| **View pending approvals** | `view_waiting_requests` (M5, unchanged) | `listRequestsWaitingForApprover` + `buildWaitingListView` |
+
+The last two are the *same* action IDs and the *same* buttons M5 already
+renders inside the Request Center modal — Home's "My Requests" rows are
+built with the same exported `buildRequestRowBlocks` helper
+(`build-requests-views.ts`), so a click behaves identically no matter which
+surface it came from.
+
+### `views.open` vs. `views.push` — the one real behavioral difference
+
+A Home tab is never part of a modal's view stack, so a Home-originated
+button click has no open modal to push onto — it must call `views.open` to
+create a brand-new one. The *same* `view_request`/`view_waiting_requests`
+buttons clicked from inside an already-open Request Center modal (M5) still
+need `views.push`, unchanged. `parse-requests-action.ts` distinguishes the
+two by reading `payload.view?.type` off the `block_actions` payload — Slack
+sets this to `"home"` for a Home tab click and `"modal"` for a click inside
+an open modal — and returns an `origin: "home" | "modal"` field the
+interactions route branches on for exactly this one API choice. The
+query/view-building code path is 100% shared; only the final Slack Web API
+call differs.
+
+### Home refresh after an action
+
+Home is **not** proactively republished after a Home-launched action (e.g.
+after creating a request via the Home button, or after deciding on a
+request opened from Home). Slack already re-fires `app_home_opened`
+whenever a user reopens/refocuses the Home tab, which naturally reflects
+the new state on next view — implementing an explicit re-publish would mean
+guessing which of several nested modal actions should trigger it and
+manufacturing a `user_id`-targeted `views.publish` call outside the normal
+event flow, for a freshness gap of at most a few seconds. Documented here
+as a deliberate scope decision, not an oversight.
+
+### Security
+
+- Every Home action re-resolves `workspace`/`viewer` from the
+  signature-verified payload's own `team.id`/`user.id` — never from a
+  client-supplied value, exactly like every other M2–M5 interaction.
+- `create_request_home`/`open_request_center` carry no request identifier at
+  all, so there's nothing to validate beyond the standard identifier checks.
+- `view_request` clicked from Home still passes only an opaque `requestId`
+  in the button value; `getRequestDetails` still requires
+  `workspace_id = workspace.id` **and** `id = requestId` together, so
+  cross-workspace access still fails safely (returns `null` → a generic
+  "not found" view, not an error leaking which workspace the ID belongs to).
+- No new database migration, no new RLS policy, no new authorization model —
+  M6 introduces zero new ways to read or write a `requests` row.
+
 ## M4 end-to-end testing procedure
 
 Both tests need: migrations pushed (`pnpm dlx supabase db push`, not run by
@@ -867,6 +1061,78 @@ Run `/requests` from an account that has submitted several requests.
 4. Have the configured approver decide → normal M4 behavior (requester
    notified, request removed from Waiting for Me for that approver).
 
+## M6 end-to-end testing procedure
+
+Needs: App Home + Event Subscriptions enabled per [M6 Slack
+configuration](#m6-slack-configuration-app-home-and-events-api) above, the
+Request URL verified, and at least one existing DIRECT and one existing
+POLICY request in the workspace (from prior M4/M5 testing).
+
+### Test A — first open, empty state
+
+On an account that has never submitted a request and has nothing pending:
+open the **Home** tab in the ApproveFlow app.
+
+- Intro/tagline, **Create Request**, and **Open Request Center** buttons
+  render.
+- My Requests shows "You haven't submitted any requests yet."
+- Waiting for Me shows "Nothing is waiting for your approval." — no button.
+
+### Test B — My Requests summary (capped at 3)
+
+On an account with more than 3 requests submitted: open Home.
+
+- Exactly the 3 most recent appear (never more), newest first, correct
+  statuses.
+- Compare against `/requests` on the same account — the same 3 requests
+  (by id/status/resource) should be the top 3 there too.
+
+### Test C — Waiting for Me summary
+
+1. Create a new DIRECT request assigned to another account.
+2. On that approver's account, open Home → "Waiting for Me" shows a count of
+   at least 1 and a **View pending approvals** button.
+3. Click it → the same Waiting for Me list `/requests` would show, with
+   Approve/Reject available on the request.
+4. Approve it → re-open Home on that account → the count decreases
+   (eventually to 0, showing the empty-state message again once nothing is
+   left).
+
+### Test D — Create Request from Home
+
+1. Click **Create Request** on Home.
+2. The exact same "New Request" modal as `/request` opens (same fields:
+   Request Type, Resource, Reason, Duration, Approver).
+3. Submit with no active policy for the chosen type → the selected approver
+   gets a DM, identical to the `/request` flow (M4 Test A).
+4. Submit for a request type with an active policy → policy routing takes
+   precedence, identical to the `/request` flow (M4 Test B) — the manually
+   selected approver is never persisted as the approver.
+
+### Test E — Open Request Center from Home
+
+1. Click **Open Request Center** on Home.
+2. The exact same Request Center modal `/requests` opens — full My Requests
+   list (up to 10) and Waiting for Me summary.
+3. From inside it, click **View** on a row → pushes Request Details onto the
+   *same* modal (back arrow appears) — this is the unchanged M5 `views.push`
+   path, not `views.open`, since this click originates from inside an
+   already-open modal, not from Home.
+
+### Test F — cross-workspace / uninstalled safety
+
+1. If you have a second ApproveFlow-installed workspace, open Home there —
+   its data must be completely independent (no bleed-through of the first
+   workspace's requests/counts).
+2. Manually send a `url_verification` request with a correct signature but
+   for the wrong signing secret (or a stale timestamp) → must receive `401`,
+   never an echoed challenge.
+3. (Optional, destructive — only if you have a disposable test workspace)
+   Uninstall the app, then trigger `app_home_opened` for that team (e.g. by
+   an admin reinstalling and immediately opening Home, or by inspecting
+   server logs after an uninstall) → the endpoint must ack 200 without
+   error, never a 500.
+
 ## Project structure
 
 ```
@@ -880,7 +1146,8 @@ src/
         commands/
           request/route.ts         # POST /api/slack/commands/request — /request slash command
           requests/route.ts        # POST /api/slack/commands/requests — /requests slash command (M5)
-        interactions/route.ts      # POST /api/slack/interactions — modal submissions, Approve/Reject, /requests navigation
+        events/route.ts            # POST /api/slack/events — Events API: url_verification + app_home_opened (M6)
+        interactions/route.ts      # POST /api/slack/interactions — modal submissions, Approve/Reject, /requests + Home navigation
     slack/installed/page.tsx       # OAuth result page
     page.tsx                       # home page (Add to Slack button)
     layout.tsx
@@ -899,6 +1166,8 @@ src/
       verify-request.test.ts
       format-date.ts              # pure (M5): Slack date-token formatting (unit tested)
       format-date.test.ts
+      parse-slack-event.ts        # pure (M6): Events API envelope classifier — url_verification / app_home_opened / ignored (unit tested)
+      parse-slack-event.test.ts
     requests/
       duration-options.ts         # pure: shared duration select options + labels
       request-types.ts            # server-only: default request types + idempotent seeding
@@ -919,11 +1188,13 @@ src/
       notify-requester.ts         # server-only: sends the final-decision DM to the requester
       status-display.ts           # pure (M5): status emoji + text label (unit tested)
       status-display.test.ts
-      parse-requests-action.ts    # pure (M5): /requests navigation click validation (unit tested)
+      parse-requests-action.ts    # pure (M5, extended M6): /requests + Home navigation click validation, incl. views.open vs. views.push origin (unit tested)
       parse-requests-action.test.ts
       build-requests-views.ts     # pure (M5): Request Center / Waiting List / Request Details Block Kit views (unit tested)
       build-requests-views.test.ts
-      request-views.ts            # server-only (M5): listRequestsByRequester, listRequestsWaitingForApprover, getRequestDetails
+      build-app-home-view.ts      # pure (M6): App Home Block Kit view builder, reuses build-requests-views' row builder (unit tested)
+      build-app-home-view.test.ts
+      request-views.ts            # server-only (M5, extended M6): listRequestsByRequester (now takes an optional limit), listRequestsWaitingForApprover, getRequestDetails
     supabase/
       admin.ts                    # server-only: service-role Supabase client
   types/
@@ -947,4 +1218,5 @@ supabase/
     *_update_decide_on_request_for_direct_routing.sql
     *_enforce_direct_approval_threshold.sql
     # M5 adds no migration — the existing schema already had everything needed.
+    # M6 adds no migration either — Home is a read-mostly front door over the existing schema.
 ```

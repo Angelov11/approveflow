@@ -32,8 +32,14 @@ export interface RequestListResult {
   totalCount: number;
 }
 
-/** Always scoped by BOTH requesterId and workspaceId — never trust one without the other. */
-export async function listRequestsByRequester(workspaceId: string, requesterId: string): Promise<RequestListResult> {
+/**
+ * Always scoped by BOTH requesterId and workspaceId — never trust one
+ * without the other. `limit` defaults to the M5 "/requests" page size;
+ * App Home (M6) passes a smaller limit for its compact summary — same
+ * query/semantics, just a different requested count, so this stays the
+ * single source of truth rather than a second query being written.
+ */
+export async function listRequestsByRequester(workspaceId: string, requesterId: string, limit: number = MY_REQUESTS_LIMIT): Promise<RequestListResult> {
   const supabase = getSupabaseAdmin();
   const { data, error, count } = await supabase
     .from("requests")
@@ -41,7 +47,7 @@ export async function listRequestsByRequester(workspaceId: string, requesterId: 
     .eq("workspace_id", workspaceId)
     .eq("requester_id", requesterId)
     .order("created_at", { ascending: false })
-    .range(0, MY_REQUESTS_LIMIT - 1);
+    .range(0, limit - 1);
 
   if (error) {
     throw new Error(`Failed to list requests by requester: ${error.message}`);

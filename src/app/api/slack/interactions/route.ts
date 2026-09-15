@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+
 import { WebClient } from "@slack/web-api";
 import type { NextRequest } from "next/server";
 
@@ -5,15 +7,22 @@ import { serverEnv } from "@/lib/env.server";
 import { decideOnRequest } from "@/lib/requests/approval-actions";
 import { findActivePolicyForRequestType, listPolicyRecipients } from "@/lib/requests/approval-policies";
 import { describeDecisionOutcome, replaceActionsWithStatus, APPROVE_ACTION_ID, REJECT_ACTION_ID } from "@/lib/requests/build-approval-notification";
-import { REQUEST_MODAL_CALLBACK_ID } from "@/lib/requests/build-request-modal";
-import { buildErrorView, buildRequestDetailsView, buildWaitingListView } from "@/lib/requests/build-requests-views";
+import { buildRequestModal, REQUEST_MODAL_CALLBACK_ID } from "@/lib/requests/build-request-modal";
+import { buildErrorView, buildRequestCenterView, buildRequestDetailsView, buildWaitingListView, type ModalView } from "@/lib/requests/build-requests-views";
 import { isFinalDecisionTransition } from "@/lib/requests/build-requester-decision-notification";
 import { notifyApprovers, type NotificationRecipient } from "@/lib/requests/notify-approvers";
 import { notifyRequesterOfDecision } from "@/lib/requests/notify-requester";
 import { parseApprovalBlockAction, type BlockActionsPayload } from "@/lib/requests/parse-block-action";
-import { parseRequestsNavigationAction, VIEW_REQUEST_ACTION_ID, VIEW_WAITING_REQUESTS_ACTION_ID, type RequestsNavigationPayload } from "@/lib/requests/parse-requests-action";
-import { getRequestDetails, listRequestsWaitingForApprover } from "@/lib/requests/request-views";
-import { listActiveRequestTypes } from "@/lib/requests/request-types";
+import {
+  CREATE_REQUEST_ACTION_ID,
+  OPEN_REQUEST_CENTER_ACTION_ID,
+  parseRequestsNavigationAction,
+  VIEW_REQUEST_ACTION_ID,
+  VIEW_WAITING_REQUESTS_ACTION_ID,
+  type RequestsNavigationPayload,
+} from "@/lib/requests/parse-requests-action";
+import { getRequestDetails, listRequestsByRequester, listRequestsWaitingForApprover } from "@/lib/requests/request-views";
+import { ensureDefaultRequestTypes, listActiveRequestTypes } from "@/lib/requests/request-types";
 import { validateRequestSubmission, type ViewSubmissionPayload } from "@/lib/requests/validate-request-submission";
 import { findWorkspaceBySlackTeamId, upsertSlackUser } from "@/lib/requests/workspace-lookup";
 import { decryptBotToken } from "@/lib/slack/token-encryption";
@@ -59,7 +68,12 @@ export async function POST(request: NextRequest) {
     if (actionId === APPROVE_ACTION_ID || actionId === REJECT_ACTION_ID) {
       return handleApprovalAction(payload as BlockActionsPayload);
     }
-    if (actionId === VIEW_REQUEST_ACTION_ID || actionId === VIEW_WAITING_REQUESTS_ACTION_ID) {
+    if (
+      actionId === VIEW_REQUEST_ACTION_ID ||
+      actionId === VIEW_WAITING_REQUESTS_ACTION_ID ||
+      actionId === OPEN_REQUEST_CENTER_ACTION_ID ||
+      actionId === CREATE_REQUEST_ACTION_ID
+    ) {
       return handleRequestsNavigation(payload as RequestsNavigationPayload);
     }
     // Not one of our recognized actions — ignore safely.
@@ -263,13 +277,25 @@ async function handleApprovalAction(payload: BlockActionsPayload): Promise<Respo
   return ack();
 }
 
-/** Navigation within the /requests modal flow: opening a request's details, or pushing the full "Waiting for Me" list. Never an authorization decision — just reads. */
+/**
+ * Navigation within the /requests modal flow, AND from the App Home tab
+ * (M6) — opening a request's details, pushing the full "Waiting for Me"
+ * list, opening the Request Center, or opening a fresh "New Request" modal.
+ * Never an authorization decision — just reads (plus, for Create Request,
+ * the same idempotent bootstrap /request itself does).
+ *
+ * A modal-originated click appends to that modal's stack (views.push, M5
+ * unchanged); a Home-originated click has no stack to append to and opens a
+ * new top-level modal (views.open) — see the `origin` field on the parsed
+ * result for why. Either way, the underlying view is built by the exact
+ * same M5 functions.
+ */
 async function handleRequestsNavigation(payload: RequestsNavigationPayload): Promise<Response> {
   const parsed = parseRequestsNavigationAction(payload);
   if (!parsed.ok) {
     return ack();
   }
-  const { slackTeamId, slackUserId, triggerId } = parsed.data;
+  const { slackTeamId, slackUserId, triggerId, origin } = parsed.data;
 
   const workspace = await findWorkspaceBySlackTeamId(slackTeamId);
   if (!workspace) {
@@ -279,15 +305,28 @@ async function handleRequestsNavigation(payload: RequestsNavigationPayload): Pro
   try {
     const viewer = await upsertSlackUser(workspace.id, slackUserId);
 
-    let view;
+    let view: ModalView;
     if (parsed.data.actionId === VIEW_WAITING_REQUESTS_ACTION_ID) {
       const waitingRequests = await listRequestsWaitingForApprover(workspace.id, viewer.id);
       view = buildWaitingListView({ waitingRequests });
-    } else {
+    } else if (parsed.data.actionId === VIEW_REQUEST_ACTION_ID) {
       // Revalidates workspace ownership again inside getRequestDetails —
       // the request id from the button value is an opaque locator only.
       const details = await getRequestDetails(workspace.id, parsed.data.requestId, viewer.id);
       view = details ? buildRequestDetailsView({ details }) : buildErrorView("This request could not be found.");
+    } else if (parsed.data.actionId === OPEN_REQUEST_CENTER_ACTION_ID) {
+      const [{ rows: myRequests, totalCount }, waitingRequests] = await Promise.all([
+        listRequestsByRequester(workspace.id, viewer.id),
+        listRequestsWaitingForApprover(workspace.id, viewer.id),
+      ]);
+      view = buildRequestCenterView({ myRequests, myRequestsTotalCount: totalCount, waitingCount: waitingRequests.length });
+    } else {
+      // CREATE_REQUEST_ACTION_ID — mirrors /request's own bootstrap exactly,
+      // since Home must work for a user who has never run any command
+      // before.
+      await ensureDefaultRequestTypes(workspace.id);
+      const requestTypes = await listActiveRequestTypes(workspace.id);
+      view = buildRequestModal({ requestTypes, idempotencyKey: randomUUID() });
     }
 
     const botToken = decryptBotToken({
@@ -296,9 +335,13 @@ async function handleRequestsNavigation(payload: RequestsNavigationPayload): Pro
       authTag: workspace.bot_access_token_auth_tag,
     });
     const client = new WebClient(botToken);
-    await client.views.push({ trigger_id: triggerId, view } as Parameters<typeof client.views.push>[0]);
+    if (origin === "home") {
+      await client.views.open({ trigger_id: triggerId, view } as Parameters<typeof client.views.open>[0]);
+    } else {
+      await client.views.push({ trigger_id: triggerId, view } as Parameters<typeof client.views.push>[0]);
+    }
   } catch (error) {
-    console.error("Failed to push /requests navigation view:", error instanceof Error ? error.message : "unknown error");
+    console.error("Failed to open/push /requests navigation view:", error instanceof Error ? error.message : "unknown error");
   }
 
   return ack();

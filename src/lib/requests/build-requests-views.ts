@@ -64,7 +64,8 @@ export interface RequestDetailsView {
   canCurrentUserDecide: boolean;
 }
 
-function buildRequestRowBlocks(requests: RequestSummary[]): unknown[] {
+/** Exported for reuse by the App Home builder (M6) — Home's "My Requests" rows are the exact same shape as the Request Center's. */
+export function buildRequestRowBlocks(requests: RequestSummary[]): unknown[] {
   return requests.map((r) => ({
     type: "section",
     text: {
