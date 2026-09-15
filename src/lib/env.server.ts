@@ -13,7 +13,7 @@ export const serverEnv = {
 
   SLACK_CLIENT_ID: process.env.SLACK_CLIENT_ID,
   SLACK_CLIENT_SECRET: process.env.SLACK_CLIENT_SECRET,
-  /** Not consumed yet — reserved for verifying inbound Slack request signatures once M2 adds endpoints that receive them (events, interactions, slash commands). */
+  /** Verifies inbound Slack request signatures (slash command + interactions routes). */
   SLACK_SIGNING_SECRET: process.env.SLACK_SIGNING_SECRET,
   /** Base64-encoded, 32-byte random key. See src/lib/crypto/token-cipher.ts for the AES-256-GCM usage. */
   SLACK_TOKEN_ENCRYPTION_KEY: process.env.SLACK_TOKEN_ENCRYPTION_KEY,

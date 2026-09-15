@@ -14,7 +14,10 @@ export interface ViewSubmissionPayload {
     callback_id?: string;
     private_metadata?: string;
     state?: {
-      values?: Record<string, Record<string, { value?: string | null; selected_option?: { value?: string } | null }>>;
+      values?: Record<
+        string,
+        Record<string, { value?: string | null; selected_option?: { value?: string } | null; selected_user?: string | null }>
+      >;
     };
   };
 }
@@ -27,6 +30,8 @@ export interface ValidatedRequestSubmission {
   resource: string;
   reason: string;
   requestedDurationMinutes: number | null;
+  /** The Slack user ID selected via the modal's native picker — an identifier only, not an authorization claim. See the interactions route for how it's actually used (or discarded) depending on routing. */
+  selectedApproverSlackId: string;
 }
 
 export type RequestSubmissionResult =
@@ -35,10 +40,15 @@ export type RequestSubmissionResult =
 
 const MAX_RESOURCE_LENGTH = 200;
 const MAX_REASON_LENGTH = 2000;
+// Slack user IDs are alphanumeric, conventionally starting with U (or W for
+// some legacy/shared-channel cases) — a light format check against a
+// forged/malformed value, not full validation (Slack's own picker already
+// guarantees a well-formed ID under normal use).
+const SLACK_USER_ID_PATTERN = /^[UW][A-Z0-9]{2,}$/i;
 
 function getFieldValue(payload: ViewSubmissionPayload, blockId: string, actionId: string): string | undefined {
   const field = payload.view?.state?.values?.[blockId]?.[actionId];
-  return field?.selected_option?.value ?? field?.value ?? undefined;
+  return field?.selected_option?.value ?? field?.selected_user ?? field?.value ?? undefined;
 }
 
 /**
@@ -97,6 +107,17 @@ export function validateRequestSubmission(
     errors.duration_block = "Please select a valid duration.";
   }
 
+  // Required even though a POLICY-routed submission will end up ignoring
+  // it server-side — the modal can't know client-side whether a policy
+  // exists for the currently-selected request type without dynamic modal
+  // mutation, which M4 deliberately doesn't implement. See build-request-
+  // modal.ts's hint text and the interactions route for how this is
+  // resolved/discarded depending on routing.
+  const selectedApproverSlackId = getFieldValue(payload, "approver_block", "approver_select");
+  if (!selectedApproverSlackId || !SLACK_USER_ID_PATTERN.test(selectedApproverSlackId)) {
+    errors.approver_block = "Please select an approver.";
+  }
+
   if (Object.keys(errors).length > 0) {
     return { ok: false, errors };
   }
@@ -111,6 +132,7 @@ export function validateRequestSubmission(
       resource,
       reason,
       requestedDurationMinutes: requestedDurationMinutes as number | null,
+      selectedApproverSlackId: selectedApproverSlackId as string,
     },
   };
 }

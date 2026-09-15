@@ -22,6 +22,9 @@ export interface RequestType {
 
 export type RequestStatus = "PENDING" | "APPROVED" | "REJECTED" | "CANCELLED" | "EXPIRED";
 
+/** Frozen at creation — see the M4 migration adding these columns for why this is never re-derived later. */
+export type RoutingType = "POLICY" | "DIRECT";
+
 export interface RequestRow {
   id: string;
   workspace_id: string;
@@ -32,6 +35,13 @@ export interface RequestRow {
   requested_duration_minutes: number | null;
   status: RequestStatus;
   idempotency_key: string;
+  routing_type: RoutingType;
+  /** Snapshotted policy id for POLICY routing. Null for DIRECT requests and for historical rows with no identifiable policy at backfill time. */
+  approval_policy_id: string | null;
+  /** The requester-selected Slack user's internal id, for DIRECT routing only. */
+  direct_approver_id: string | null;
+  /** Snapshotted at creation — always 1 for DIRECT. */
+  required_approval_count: number;
   created_at: string;
   updated_at: string;
 }

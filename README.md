@@ -8,22 +8,38 @@ audit trail. Later milestones may integrate with AWS, GitHub, Supabase
 auth providers, and Google Workspace to automatically grant/revoke
 temporary access.
 
-## Current milestone: M3 — Approval Policies + Approve/Reject
+## Current milestone: M4 — Zero-Configuration Direct Approver Selection
 
 M0 set up the application skeleton. M1 added Slack OAuth installation with
 encrypted bot-token storage. M2 added `/request`: a workspace member submits
-a request via a Slack modal, persisted with `PENDING` status.
+a request via a Slack modal, persisted with `PENDING` status. M3 added
+approval policies: an admin configures who must approve each request type,
+and ApproveFlow DMs them with Approve/Reject buttons.
 
-M3 adds the actual approval step: when a request is created, ApproveFlow
-resolves that request type's approval policy, DMs each configured approver
-with the request details and Approve/Reject buttons, and atomically records
-their decision — transitioning the request to `APPROVED` once enough
-approvals are in, or to `REJECTED` immediately on any rejection.
+**M4's product goal: ApproveFlow is now useful immediately after
+installation, with no configuration step required.** Structured approvals
+in Slack — request anything, pick an approver, get a decision in Slack:
+
+1. Install ApproveFlow
+2. Run `/request`
+3. Fill in Request Type, Resource, Reason, Duration, and pick an **Approver**
+4. Submit
+5. The selected approver gets a Slack DM with Approve/Reject buttons
+6. They decide — recorded atomically, same as M3
+
+No admin setup is required for this default path. M3's approval policies
+remain fully supported as an **optional, advanced** feature: if an admin
+has configured an active policy for a request type (see [Approval policy
+configuration](#approval-policy-configuration) below), ApproveFlow
+automatically uses that policy instead of the manually selected approver.
+Policy routing always takes precedence — a requester's pick can never
+override configured company policy.
 
 **Still NOT implemented:** a web admin dashboard, App Home, an audit event
 system, automatic access provisioning/revocation (AWS/GitHub/etc.), billing,
-rejection-reason modals, escalation, reminders, channel-based approval, or
-user authentication. Those belong to M4 and later.
+rejection-reason modals, escalation, reminders, channel-based approval,
+multiple manually-selected approvers, or user authentication. Those belong
+to M5 and later.
 
 ## Prerequisites
 
@@ -160,6 +176,17 @@ approver mentions use stored `display_name` when available, otherwise a
 client-side with no extra scope needed (see
 [User display names](#user-display-names) below).
 
+**M4 adds no new scope at all.** The `/request` modal's new Approver field
+uses Block Kit's native `users_select` element — Slack renders and
+populates the picker itself from its own directory; this app never calls
+an API to list workspace users. Checked directly against Slack's current
+Block Kit reference before implementing: no scope is documented as
+required for `users_select`, consistent with how `chat.postMessage`
+already resolves a bare user ID into a DM with just `chat:write`. The
+picker submits only a user ID (`selected_user` in the view_submission
+payload) — never a name or profile — so there was never a `users:read`
+dependency to begin with.
+
 **Because this adds a new bot scope, you must reinstall the app** (visit
 `/api/slack/install` again) for any workspace that was installed under M1/M2
 — existing installations won't have `chat:write` on their token until they
@@ -249,7 +276,12 @@ delivery failure doesn't block or fail the others. This runs as-is on
 Vercel serverless functions with no architectural changes between local and
 production.
 
-## Approval policy configuration (M3)
+## Approval policy configuration (optional, M3)
+
+**This is optional.** As of M4, ApproveFlow works with zero configuration —
+requesters pick an approver directly in the modal. Configure a policy only
+if you want a request type to always route to a fixed set of approvers
+regardless of who submits it, or to require more than one approval.
 
 There's no admin UI yet. Policies and their approvers are configured with a
 one-off script run locally against your Supabase project — not an HTTP
@@ -329,24 +361,29 @@ Runs with Node's built-in test runner (`node --experimental-strip-types
   deterministic, input-sensitive, and distinct from the raw client secret.
 - `src/lib/slack/verify-request.test.ts` — valid/invalid/missing signature,
   missing/stale/future timestamp, tampered body, malformed signature, wrong secret.
-- `src/lib/requests/validate-request-submission.test.ts` — valid submission,
-  unknown request type, malformed/unknown duration, empty resource/reason,
-  oversized input, malformed private_metadata, multiple simultaneous errors.
+- `src/lib/requests/validate-request-submission.test.ts` — valid submission
+  (including the M4 approver field), unknown request type,
+  malformed/unknown duration, empty resource/reason, oversized input,
+  malformed private_metadata, missing/malformed approver selection,
+  multiple simultaneous errors.
 - `src/lib/requests/parse-block-action.test.ts` — valid Approve/Reject
   actions recognized, unknown action ignored, missing identifiers/malformed
   value rejected safely.
 - `src/lib/requests/compute-decision-outcome.test.ts` — the approval
-  state-machine: authorized approval, unauthorized approver, below-threshold
-  stays PENDING, threshold transitions to APPROVED, rejection transitions
-  immediately, duplicate decision from the same approver, decisions after
-  APPROVED/REJECTED are ignored, no-policy handling, single-approver
-  policies. See [Atomic approval design](#atomic-approval-design) for why
-  this is a *pure mirror* of the real enforcement, not the enforcement itself.
+  state-machine for **both routing models**: policy-based (authorized
+  approval, unauthorized approver, below-threshold stays PENDING, threshold
+  transitions to APPROVED, immediate rejection, duplicate decision,
+  decisions after APPROVED/REJECTED ignored, no-policy/missing-snapshot
+  handling, single-approver policies) and direct (selected approver can
+  approve/reject, a different user is denied, duplicate decision is safe,
+  decisions after finalization are ignored), plus explicit routing-stability
+  cases. See [Atomic approval design](#atomic-approval-design) for why this
+  is a *pure mirror* of the real enforcement, not the enforcement itself.
 
 These are unit tests only. Real Slack traffic (an actual `/request` invocation
 and modal submission from Slack's servers) has not been tested — that
 requires the Request URLs above to be configured against a publicly
-reachable endpoint. See the verification notes in the M1/M2/M3 completion reports.
+reachable endpoint. See the verification notes in the M1/M2/M3/M4 completion reports.
 
 ## Atomic approval design
 
@@ -361,13 +398,23 @@ approval count — see the migration's header comment for the exact race this
 prevents (two concurrent transactions each seeing only their own
 not-yet-committed approval and neither ever reaching the threshold).
 
+As of M4, the function branches on the request's own frozen
+`routing_type` to decide HOW to authorize: for `POLICY` requests, the
+approver must be a member of the snapshotted `approval_policy_id`; for
+`DIRECT` requests, the approver must exactly equal `direct_approver_id`.
+Both models share the same lock, the same duplicate-decision check, and the
+same threshold/finalization logic (reading `required_approval_count` off
+the request row itself, not a live policy lookup) — approvers never need to
+know or care which routing model applies to the request they're deciding on.
+
 `src/lib/requests/compute-decision-outcome.ts` is a pure TypeScript mirror
-of the same algorithm, and it's what's actually unit tested (13 cases) —
-SQL can't run under Node's test runner. It is a specification the SQL
-function is written to match, reviewed for consistency, not a
-transactional guarantee in its own right; re-implementing the count/update
-in JS would reintroduce the exact race the DB-level lock exists to prevent.
-Keep both in sync if the algorithm ever changes.
+of the same algorithm, and it's what's actually unit tested (17 cases,
+covering both routing models plus stability) — SQL can't run under Node's
+test runner. It is a specification the SQL function is written to match,
+reviewed for consistency, not a transactional guarantee in its own right;
+re-implementing the count/update in JS would reintroduce the exact race the
+DB-level lock exists to prevent. Keep both in sync if the algorithm ever
+changes.
 
 ## Build
 
@@ -422,12 +469,21 @@ Migrations so far:
   function described in [Atomic approval design](#atomic-approval-design).
   Explicitly revokes the default Postgres `PUBLIC` execute grant and
   re-grants only to `service_role`.
+- `*_add_direct_approver_routing_to_requests.sql` (M4) — adds `routing_type`,
+  `approval_policy_id`, `direct_approver_id`, and `required_approval_count`
+  to `requests`, backfills existing rows, and adds a CHECK constraint
+  preventing contradictory routing states. See
+  [Routing stability / policy snapshot design](#routing-stability--policy-snapshot-design).
+- `*_update_decide_on_request_for_direct_routing.sql` (M4) — `create or
+  replace`s `decide_on_request()` (the M3 migration that first created it is
+  untouched) so it authorizes both POLICY and DIRECT routed requests. Same
+  grants re-asserted (service_role only).
 
-**M3's two new migrations have not been pushed to the linked remote project
-yet** — they exist locally only, same as M2's were before you pushed them.
-Run `pnpm dlx supabase db push` when you're ready to apply them (or
-`pnpm dlx supabase start` against a local Postgres instance first, if
-Docker is running). I did not run this myself.
+**M4's two new migrations have not been pushed to the linked remote project
+yet** — they exist locally only, same as every prior milestone's migrations
+were before you pushed them. Run `pnpm dlx supabase db push` when you're
+ready to apply them (or `pnpm dlx supabase start` against a local Postgres
+instance first, if Docker is running). I did not run this myself.
 
 ## Database security
 
@@ -462,18 +518,69 @@ function operates on internal UUIDs already resolved server-side from the
 trusted, signature-verified Slack payload — it never receives or trusts a
 client-supplied workspace/user identifier directly.
 
-## No active policy behavior
+## Routing: policy vs. direct (M4)
 
-If a request's type has no active approval policy, the request is **left
-`PENDING` with no notification sent** — never auto-approved. This is
-logged at info level (`console.log`, not `console.error`, since it's a
-valid/expected state, not a failure) with only internal IDs (workspace id,
-request type id, request id) — no Slack tokens, no user-identifying
-content. See `src/lib/requests/notify-approvers.ts`. Configure a policy
-with `scripts/configure-approval-policy.ts` (above) to unstick it — M3 has
-no mechanism to retroactively notify approvers for a request that was
-already created before a policy existed; that would need a manual
-`decide_on_request` call or a future milestone's tooling.
+Every request is routed exactly once, at creation, in
+`src/app/api/slack/interactions/route.ts`:
+
+1. The requester always picks an **Approver** in the modal (required —
+   see [Modal validation compromise](#modal-validation-compromise) below).
+2. The interactions route checks whether an *active* approval policy
+   exists for the selected request type
+   (`src/lib/requests/approval-policies.ts`).
+3. **Policy exists → POLICY routing.** The request is governed by that
+   policy; the requester's manually selected approver is resolved (so it's
+   confirmed to be a real workspace user) but is **not** persisted as the
+   request's approver — company policy always wins, and a requester can
+   never route around it by picking someone outside the policy.
+4. **No active policy → DIRECT routing.** The request's approver is
+   exactly the person the requester selected, and exactly **1** approval
+   is required — no multi-approver direct routing in M4 (that's still only
+   available via M3 policies).
+
+A request is never left unroutable: M3's old "no policy → PENDING forever
+with nobody notified" behavior no longer exists as a reachable state under
+normal use, since the modal always collects a fallback approver. It only
+occurs now if a submission is malformed/forged in a way that bypasses the
+required Approver field — validated server-side regardless (see
+[Modal validation compromise](#modal-validation-compromise)).
+
+### Routing stability / policy snapshot design
+
+A request's routing must not change after the fact just because policies
+changed later — see the migration adding `routing_type`,
+`approval_policy_id`, `direct_approver_id`, and `required_approval_count`
+to `requests` for the full design rationale. Summary:
+
+- **`routing_type`** and **`approval_policy_id`** are frozen at creation —
+  `decide_on_request()` never re-asks "is there an active policy right
+  now"; a request created under Policy A stays governed by Policy A even
+  if it's later disabled and replaced by Policy B for the same request type.
+- **`required_approval_count`** is also frozen at creation (snapshotted
+  from the policy's `required_approvals`, or always `1` for DIRECT) — so
+  editing a policy's threshold later doesn't retroactively change the
+  requirement for requests already in flight.
+- **Policy *membership* is deliberately NOT frozen** — a POLICY request's
+  authorization always reads `approval_policy_members` live via the
+  snapshotted `approval_policy_id`. This is an intentional asymmetry: policy
+  *identity* and *threshold* are frozen for routing stability, but *who* can
+  currently act under that policy stays live, because immediately revoking
+  someone's approval rights (e.g. they left the team) is the safer default
+  than honoring a stale membership snapshot for requests still pending.
+
+### Modal validation compromise
+
+The Approver field is shown and required for every request type, even
+though a POLICY-routed submission ends up discarding the selection — the
+modal can't know client-side whether a policy exists for the currently
+selected request type without dynamic modal mutation, which M4 deliberately
+doesn't implement (kept out of scope to avoid "complicated live modal
+mutation"). The field's hint text ("Used when no approval policy is
+configured for this request type.") sets that expectation for the
+requester. If no policy exists and no valid approver was submitted anyway
+(a forged/malformed submission, since Slack's own UI won't allow an empty
+required field under normal use), the interactions route rejects it with a
+field-level error rather than creating an unroutable request.
 
 ## Notification/decision delivery failures
 
@@ -526,17 +633,52 @@ client-side regardless, so the fallback looks correct without needing any
 additional scope. See `formatUserMention()` in
 `src/lib/requests/build-approval-notification.ts`.
 
-## M3 end-to-end testing procedure
+## M4 end-to-end testing procedure
 
-1. Push the two new M3 migrations: `pnpm dlx supabase db push` (not run by me — see [Supabase local development](#supabase-local-development)).
-2. Reinstall the Slack app (`/api/slack/install`) so its token includes the new `chat:write` scope.
-3. Run `/request` once in the workspace if you haven't already since the request types were added — this seeds the 5 default `request_types` rows.
-4. Configure a policy: `node --experimental-strip-types --env-file=.env.local scripts/configure-approval-policy.ts --team <T...> --request-type production_access --name "Test Policy" --required 1 --approver <your own Slack user ID>` (use `--required 1` and yourself as the sole approver for the simplest first test).
-5. Run `/request`, submit a Production Access request.
-6. You should receive a DM with the request details and Approve/Reject buttons.
-7. Click Approve — the message should update to "✅ Request approved." (since required_approvals=1), and the `requests` row's `status` should be `APPROVED`.
-8. Click the same button again (or have Slack redeliver) — should be a safe no-op (`already_decided`), not a duplicate `approvals` row.
-9. For multi-approver testing, reconfigure with `--required 2` and two different `--approver` Slack IDs, then repeat: first approval should leave the request `PENDING`, second should transition it to `APPROVED`; a rejection at any point should transition it to `REJECTED` immediately.
+Both tests need: migrations pushed (`pnpm dlx supabase db push`, not run by
+me), and the Slack app reinstalled if it hasn't already picked up
+`chat:write` from M3.
+
+### Test A — zero configuration (no policy)
+
+Use a request type with **no** active policy (`deployment_approval`,
+`software_access`, `purchase_approval`, or `custom` — assuming you haven't
+configured a policy for any of them).
+
+1. Run `/request` in Slack.
+2. Select that request type, fill in Resource/Reason/Duration.
+3. In **Approver**, select a *different* Slack user (a colleague, or a
+   second test account).
+4. Submit.
+5. That selected user should receive a DM with the request details and
+   Approve/Reject buttons — no policy configuration needed anywhere.
+6. Have them click **Approve** — their message should update to
+   "✅ Request approved.", and the `requests` row's `status` should be
+   `APPROVED`, `routing_type` = `DIRECT`, `direct_approver_id` = their
+   internal user id, `required_approval_count` = `1`.
+7. Repeat with a fresh `/request`, same approver, click **Reject** instead
+   — should transition straight to `REJECTED`.
+
+### Test B — existing policy takes precedence
+
+Use `production_access`, which already has an active M3 policy configured
+in this workspace (single approver, `required_approvals = 1`).
+
+1. Run `/request`, select **Production Access**.
+2. In **Approver**, deliberately select someone who is **not** the
+   configured policy member.
+3. Submit.
+4. Verify in Supabase: the new request's `routing_type` = `POLICY`,
+   `approval_policy_id` is set, `direct_approver_id` is **null** — the
+   manually selected person was never persisted as the approver.
+5. Verify only the actual policy member(s) received the DM — not the
+   person selected in the modal.
+6. If the person selected in the modal (who is not a policy member)
+   somehow tried to click Approve on some other message, `decide_on_request`
+   must return `unauthorized` and the request must remain `PENDING` —
+   selection in the modal must never itself grant authorization.
+7. Have the real policy member approve — should behave exactly as in M3
+   (atomic transition to `APPROVED`, single `approvals` row).
 
 ## Project structure
 
@@ -570,21 +712,22 @@ src/
       duration-options.ts         # pure: shared duration select options + labels
       request-types.ts            # server-only: default request types + idempotent seeding
       workspace-lookup.ts         # server-only: workspace/user lookup+upsert
-      build-request-modal.ts      # pure: Block Kit modal builder
+      build-request-modal.ts      # pure: Block Kit modal builder (incl. M4 Approver users_select)
       validate-request-submission.ts  # pure: view_submission validation (unit tested)
       validate-request-submission.test.ts
       build-approval-notification.ts  # pure: approver DM builder, message update, outcome text
       parse-block-action.ts       # pure: block_actions (Approve/Reject) validation (unit tested)
       parse-block-action.test.ts
-      compute-decision-outcome.ts # pure mirror of decide_on_request()'s algorithm (unit tested)
+      compute-decision-outcome.ts # pure mirror of decide_on_request()'s algorithm (unit tested; both routing models)
       compute-decision-outcome.test.ts
       approval-actions.ts         # server-only: decide_on_request() RPC wrapper
-      notify-approvers.ts         # server-only: resolves policy+members, sends DMs
+      approval-policies.ts        # server-only (M4): active-policy lookup + policy recipient list
+      notify-approvers.ts         # server-only: sends DMs to a precomputed recipient list
     supabase/
       admin.ts                    # server-only: service-role Supabase client
   types/
     workspace.ts                  # Workspace row type
-    request.ts                    # User, RequestType, RequestRow types
+    request.ts                    # User, RequestType, RequestRow types (incl. M4 routing fields)
     approval.ts                   # ApprovalPolicy, Approval, DecideOnRequestResult types
 
 scripts/
@@ -599,4 +742,6 @@ supabase/
     *_create_request_data_model.sql
     *_create_approval_schema.sql
     *_create_decide_on_request_function.sql
+    *_add_direct_approver_routing_to_requests.sql
+    *_update_decide_on_request_for_direct_routing.sql
 ```

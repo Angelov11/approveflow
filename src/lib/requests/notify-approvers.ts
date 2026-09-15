@@ -5,18 +5,30 @@ import { WebClient } from "@slack/web-api";
 import { buildApprovalNotification } from "@/lib/requests/build-approval-notification";
 import { formatDurationLabel } from "@/lib/requests/duration-options";
 import { decryptBotToken } from "@/lib/slack/token-encryption";
-import { getSupabaseAdmin } from "@/lib/supabase/admin";
 import type { Workspace } from "@/types/workspace";
+
+export interface NotificationRecipient {
+  slack_user_id: string;
+  display_name: string | null;
+}
 
 export interface NotifyApproversParams {
   workspace: Workspace;
   requestId: string;
-  requestTypeId: string;
   requestTypeName: string;
   resource: string;
   reason: string;
   requestedDurationMinutes: number | null;
   requester: { slack_user_id: string; display_name: string | null };
+  /**
+   * Precomputed by the caller (the interactions route): the policy's
+   * members for POLICY routing, or the single selected user for DIRECT
+   * routing. This module only sends messages — it doesn't know or care
+   * which routing mode produced the recipient list, keeping it reusable
+   * for both. See src/lib/requests/approval-policies.ts for the policy
+   * lookup this used to do internally.
+   */
+  recipients: NotificationRecipient[];
 }
 
 /**
@@ -26,51 +38,23 @@ export interface NotifyApproversParams {
  * route, right after inserting the request) can't accidentally roll
  * anything back or fail the response to Slack over a notification problem.
  *
- * "No active policy" is an expected, valid state in M3 (see the M3 report/
- * README) — logged at info level, not as an error.
+ * An empty recipient list (no active policy and no valid direct approver —
+ * shouldn't happen given modal validation, but handled defensively) is
+ * logged at info level, not as an error: the request is left PENDING
+ * rather than silently disappearing or being auto-approved.
  */
 export async function notifyApprovers({
   workspace,
   requestId,
-  requestTypeId,
   requestTypeName,
   resource,
   reason,
   requestedDurationMinutes,
   requester,
+  recipients,
 }: NotifyApproversParams): Promise<void> {
-  const supabase = getSupabaseAdmin();
-
-  const { data: policy, error: policyError } = await supabase
-    .from("approval_policies")
-    .select("id, required_approvals")
-    .eq("workspace_id", workspace.id)
-    .eq("request_type_id", requestTypeId)
-    .eq("active", true)
-    .maybeSingle();
-
-  if (policyError) {
-    console.error("Failed to look up approval policy:", policyError.message);
-    return;
-  }
-  if (!policy) {
-    console.log(
-      `No active approval policy for request type ${requestTypeId} in workspace ${workspace.id} — request ${requestId} left PENDING with no notification.`,
-    );
-    return;
-  }
-
-  const { data: members, error: membersError } = await supabase
-    .from("approval_policy_members")
-    .select("users(slack_user_id, display_name)")
-    .eq("policy_id", policy.id);
-
-  if (membersError) {
-    console.error("Failed to look up approval policy members:", membersError.message);
-    return;
-  }
-  if (!members || members.length === 0) {
-    console.log(`Approval policy ${policy.id} has no members — request ${requestId} left PENDING with no notification.`);
+  if (recipients.length === 0) {
+    console.log(`No approver(s) to notify for request ${requestId} in workspace ${workspace.id} — left PENDING.`);
     return;
   }
 
@@ -97,23 +81,14 @@ export async function notifyApprovers({
 
   const client = new WebClient(botToken);
   const results = await Promise.allSettled(
-    members.map((member) => {
-      const user = Array.isArray(member.users) ? member.users[0] : member.users;
-      if (!user) {
-        return Promise.resolve();
-      }
-      return client.chat.postMessage(
-        { channel: user.slack_user_id, ...content } as Parameters<typeof client.chat.postMessage>[0],
-      );
-    }),
+    recipients.map((recipient) =>
+      client.chat.postMessage({ channel: recipient.slack_user_id, ...content } as Parameters<typeof client.chat.postMessage>[0]),
+    ),
   );
 
   for (const result of results) {
     if (result.status === "rejected") {
-      console.error(
-        "Failed to notify an approver:",
-        result.reason instanceof Error ? result.reason.message : "unknown error",
-      );
+      console.error("Failed to notify an approver:", result.reason instanceof Error ? result.reason.message : "unknown error");
     }
   }
 }

@@ -82,6 +82,21 @@ export function buildRequestModal({ requestTypes, idempotencyKey }: BuildRequest
           })),
         },
       },
+      {
+        type: "input",
+        block_id: "approver_block",
+        label: { type: "plain_text", text: "Approver" },
+        // Slack's native picker — no users:read scope needed, no API call
+        // from this app to populate it. Shown for every request type
+        // (no dynamic modal behavior in M4); the hint clarifies it's only
+        // acted on when no approval policy governs the selected type.
+        hint: { type: "plain_text", text: "Used when no approval policy is configured for this request type." },
+        element: {
+          type: "users_select",
+          action_id: "approver_select",
+          placeholder: { type: "plain_text", text: "Select an approver" },
+        },
+      },
     ],
   } as ModalView;
 }

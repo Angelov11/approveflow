@@ -3,9 +3,10 @@ import type { NextRequest } from "next/server";
 
 import { serverEnv } from "@/lib/env.server";
 import { decideOnRequest } from "@/lib/requests/approval-actions";
+import { findActivePolicyForRequestType, listPolicyRecipients } from "@/lib/requests/approval-policies";
 import { describeDecisionOutcome, replaceActionsWithStatus } from "@/lib/requests/build-approval-notification";
 import { REQUEST_MODAL_CALLBACK_ID } from "@/lib/requests/build-request-modal";
-import { notifyApprovers } from "@/lib/requests/notify-approvers";
+import { notifyApprovers, type NotificationRecipient } from "@/lib/requests/notify-approvers";
 import { parseApprovalBlockAction, type BlockActionsPayload } from "@/lib/requests/parse-block-action";
 import { listActiveRequestTypes } from "@/lib/requests/request-types";
 import { validateRequestSubmission, type ViewSubmissionPayload } from "@/lib/requests/validate-request-submission";
@@ -89,6 +90,34 @@ async function handleRequestSubmission(payload: ViewSubmissionPayload): Promise<
     return modalErrors({ request_type_block: "That request type is no longer available. Please try again." });
   }
 
+  // Routing is decided ONCE, here, and frozen on the row — never re-derived
+  // later by asking "is there an active policy right now" (see the M4
+  // migration adding these columns for why that would be unstable).
+  //
+  // Case A: an active policy exists → POLICY routing. The requester's
+  // selected approver is resolved (so it's a valid workspace user) but
+  // deliberately NOT persisted as though they were responsible for the
+  // request — company policy takes precedence over a manual pick.
+  //
+  // Case B: no active policy → DIRECT routing, using exactly the selected
+  // approver, requiring exactly 1 approval.
+  const activePolicy = await findActivePolicyForRequestType(workspace.id, requestType.id);
+  const directApprover = await upsertSlackUser(workspace.id, result.data.selectedApproverSlackId);
+
+  const routingFields = activePolicy
+    ? {
+        routing_type: "POLICY" as const,
+        approval_policy_id: activePolicy.id,
+        direct_approver_id: null,
+        required_approval_count: activePolicy.required_approvals,
+      }
+    : {
+        routing_type: "DIRECT" as const,
+        approval_policy_id: null,
+        direct_approver_id: directApprover.id,
+        required_approval_count: 1,
+      };
+
   const supabase = getSupabaseAdmin();
   const { data: inserted, error } = await supabase
     .from("requests")
@@ -101,6 +130,7 @@ async function handleRequestSubmission(payload: ViewSubmissionPayload): Promise<
       requested_duration_minutes: result.data.requestedDurationMinutes,
       status: "PENDING",
       idempotency_key: result.data.idempotencyKey,
+      ...routingFields,
     })
     .select("id")
     .single();
@@ -120,15 +150,19 @@ async function handleRequestSubmission(payload: ViewSubmissionPayload): Promise<
   // here can't roll back or fail the response for the already-created,
   // already-committed request.
   try {
+    const recipients: NotificationRecipient[] = activePolicy
+      ? await listPolicyRecipients(activePolicy.id)
+      : [{ slack_user_id: result.data.selectedApproverSlackId, display_name: null }];
+
     await notifyApprovers({
       workspace,
       requestId: inserted.id,
-      requestTypeId: requestType.id,
       requestTypeName: requestType.name,
       resource: result.data.resource,
       reason: result.data.reason,
       requestedDurationMinutes: result.data.requestedDurationMinutes,
       requester: { slack_user_id: result.data.slackUserId, display_name: null },
+      recipients,
     });
   } catch (notifyError) {
     console.error("Unexpected error notifying approvers:", notifyError instanceof Error ? notifyError.message : "unknown error");
