@@ -8,19 +8,22 @@ audit trail. Later milestones may integrate with AWS, GitHub, Supabase
 auth providers, and Google Workspace to automatically grant/revoke
 temporary access.
 
-## Current milestone: M2 — `/request` and Request Creation
+## Current milestone: M3 — Approval Policies + Approve/Reject
 
 M0 set up the application skeleton. M1 added Slack OAuth installation with
-encrypted bot-token storage.
+encrypted bot-token storage. M2 added `/request`: a workspace member submits
+a request via a Slack modal, persisted with `PENDING` status.
 
-M2 adds request creation: a workspace member runs `/request` in Slack,
-ApproveFlow verifies the request genuinely came from Slack, opens a modal,
-and a submitted request is persisted to Supabase with `PENDING` status.
+M3 adds the actual approval step: when a request is created, ApproveFlow
+resolves that request type's approval policy, DMs each configured approver
+with the request details and Approve/Reject buttons, and atomically records
+their decision — transitioning the request to `APPROVED` once enough
+approvals are in, or to `REJECTED` immediately on any rejection.
 
-**Still NOT implemented:** approvers, approval routing, Approve/Reject
-buttons, approver DMs, App Home, automatic access provisioning
-(AWS/GitHub/etc.), audit system, billing, a web dashboard, or user
-authentication. Those belong to M3 and later.
+**Still NOT implemented:** a web admin dashboard, App Home, an audit event
+system, automatic access provisioning/revocation (AWS/GitHub/etc.), billing,
+rejection-reason modals, escalation, reminders, channel-based approval, or
+user authentication. Those belong to M4 and later.
 
 ## Prerequisites
 
@@ -93,9 +96,8 @@ automated.
    - Under **Redirect URLs**, add:
      - Local: `http://localhost:3000/api/slack/oauth/callback`
      - Production: `https://<your-vercel-domain>/api/slack/oauth/callback`
-   - Under **Scopes → Bot Token Scopes**, add: `commands`
-     (see [Slack scopes](#slack-scopes-requested) below for why — no other
-     scopes are requested in M1)
+   - Under **Scopes → Bot Token Scopes**, add: `commands` and `chat:write`
+     (see [Slack scopes](#slack-scopes-requested) below for why)
 3. Open **Basic Information** in the sidebar:
    - Under **App Credentials**, copy **Client ID** → `SLACK_CLIENT_ID`,
      **Client Secret** → `SLACK_CLIENT_SECRET`, and **Signing Secret** →
@@ -138,13 +140,32 @@ slash commands).
 
 | Scope | Type | Why |
 | ----- | ---- | --- |
-| `commands` | Bot | Required to receive the payload for the future `/request` slash command (M2). No bot scope is strictly required to complete installation alone, but Slack's OAuth v2 endpoint requires at least one bot scope to issue a bot token, so M1 requests the one scope already known to be needed next rather than something broader "just in case". |
+| `commands` | Bot | Required to receive the payload for the `/request` slash command (M2). Slack's OAuth v2 endpoint requires at least one bot scope to issue a bot token at all, so M1 anchored on this one rather than something broader "just in case". |
+| `chat:write` | Bot | M3: DMing each approver and updating that message after their decision (`chat.postMessage`/`chat.update`). |
 
-No user scopes are requested. M2 still does not request `chat:write` —
-opening/closing the modal and showing field-level validation errors are
-both done via the direct HTTP response to Slack's own requests, which
-needs no extra scope. `users:read`, events, and other scopes remain
-unrequested until a feature actually needs them.
+**`chat:write` is the only scope M3 adds — `conversations.open` (and its
+`im:write`/`mpim:write`/`channels:manage` scope requirements) is deliberately
+NOT used.** Verified against Slack's current API reference (not assumed):
+[`chat.postMessage`](https://docs.slack.dev/reference/methods/chat.postMessage)
+documents that passing a user ID directly as the `channel` parameter opens a
+DM automatically if one isn't already open, and lists `chat:write` as the
+only scope that requires — `im:write` is not mentioned. So the app never
+calls `conversations.open` at all; every approver DM and status update goes
+through `chat.postMessage`/`chat.update` with the approver's Slack user ID
+as `channel` (see `src/lib/requests/notify-approvers.ts`).
+
+No user scopes are requested. `users:read` is still not requested —
+approver mentions use stored `display_name` when available, otherwise a
+`<@SLACK_USER_ID>` mention, which Slack resolves to a name/avatar
+client-side with no extra scope needed (see
+[User display names](#user-display-names) below).
+
+**Because this adds a new bot scope, you must reinstall the app** (visit
+`/api/slack/install` again) for any workspace that was installed under M1/M2
+— existing installations won't have `chat:write` on their token until they
+reinstall. Reinstalling is safe: the OAuth callback upserts by
+`slack_team_id`, so it updates the existing `workspaces` row (with the new
+scope's token) rather than creating a duplicate.
 
 ## Slack request verification
 
@@ -215,15 +236,56 @@ deployments get unique URLs that won't match what's registered.
 
 ## Local vs. production architecture
 
-Every M2 route is a stateless Next.js Route Handler: no persistent Node
+Every route is a stateless Next.js Route Handler: no persistent Node
 server, no WebSockets, no background workers/queues. The slash command
 route does its work (workspace lookup, user upsert, ensuring default
 request types, decrypting the bot token, calling `views.open`) synchronously
 within the single request/response cycle, because Slack requires an ack
 within ~3 seconds and the `trigger_id` used to open a modal is itself only
 valid for a few seconds — there's no opportunity (or need) to defer work to
-a queue. This runs as-is on Vercel serverless functions with no
-architectural changes between local and production.
+a queue. Sending approver DMs (M3) similarly happens inline, right after
+the request is inserted, using `Promise.allSettled` so one approver's
+delivery failure doesn't block or fail the others. This runs as-is on
+Vercel serverless functions with no architectural changes between local and
+production.
+
+## Approval policy configuration (M3)
+
+There's no admin UI yet. Policies and their approvers are configured with a
+one-off script run locally against your Supabase project — not an HTTP
+endpoint, so there's nothing for an unauthenticated caller to hit:
+
+```bash
+node --experimental-strip-types --env-file=.env.local \
+  scripts/configure-approval-policy.ts \
+  --team T0123456 \
+  --request-type production_access \
+  --name "Production Access Approvers" \
+  --required 2 \
+  --approver U0111111 --approver U0222222
+```
+
+- `--team`: the Slack workspace's team ID (same value stored in `workspaces.slack_team_id`).
+- `--request-type`: one of the 5 default keys (`production_access`,
+  `deployment_approval`, `software_access`, `purchase_approval`, `custom`).
+  These only exist once `/request` has been run at least once in that
+  workspace (that's what seeds them) — run it once first if you get a "no
+  request type" error.
+- `--approver`: a Slack user ID, repeatable. Find one via a person's Slack
+  profile → **⋯** → **Copy member ID**. This app has no scope to look users
+  up by name.
+
+Re-running the script for the same `--team`/`--request-type` updates the
+existing policy in place (name, required approvals) and **replaces** its
+member list with exactly what you passed — it's not additive. M3 enforces
+at most one *active* policy per (workspace, request type) at the database
+level (a partial unique index), so this script never creates a conflicting
+second one.
+
+To inspect state directly (no dashboard yet), query Supabase — e.g. via the
+SQL editor or `curl` against `${NEXT_PUBLIC_SUPABASE_URL}/rest/v1/requests`
+with the service role key — for `requests`, `approvals`,
+`approval_policies`, and `approval_policy_members`.
 
 ## Running locally
 
@@ -270,11 +332,42 @@ Runs with Node's built-in test runner (`node --experimental-strip-types
 - `src/lib/requests/validate-request-submission.test.ts` — valid submission,
   unknown request type, malformed/unknown duration, empty resource/reason,
   oversized input, malformed private_metadata, multiple simultaneous errors.
+- `src/lib/requests/parse-block-action.test.ts` — valid Approve/Reject
+  actions recognized, unknown action ignored, missing identifiers/malformed
+  value rejected safely.
+- `src/lib/requests/compute-decision-outcome.test.ts` — the approval
+  state-machine: authorized approval, unauthorized approver, below-threshold
+  stays PENDING, threshold transitions to APPROVED, rejection transitions
+  immediately, duplicate decision from the same approver, decisions after
+  APPROVED/REJECTED are ignored, no-policy handling, single-approver
+  policies. See [Atomic approval design](#atomic-approval-design) for why
+  this is a *pure mirror* of the real enforcement, not the enforcement itself.
 
 These are unit tests only. Real Slack traffic (an actual `/request` invocation
 and modal submission from Slack's servers) has not been tested — that
 requires the Request URLs above to be configured against a publicly
-reachable endpoint. See the verification notes in the M1/M2 completion reports.
+reachable endpoint. See the verification notes in the M1/M2/M3 completion reports.
+
+## Atomic approval design
+
+Authorizing and recording an Approve/Reject decision is NOT done in
+application code — it's a single Postgres function,
+`decide_on_request(request_id, approver_id, decision)`, called via
+`supabase.rpc()` from `src/lib/requests/approval-actions.ts`. The function
+row-locks the request (`select ... for update`) before checking anything, so
+two near-simultaneous decisions on the same request (e.g. two approvers
+clicking at once) serialize at the database level instead of racing on the
+approval count — see the migration's header comment for the exact race this
+prevents (two concurrent transactions each seeing only their own
+not-yet-committed approval and neither ever reaching the threshold).
+
+`src/lib/requests/compute-decision-outcome.ts` is a pure TypeScript mirror
+of the same algorithm, and it's what's actually unit tested (13 cases) —
+SQL can't run under Node's test runner. It is a specification the SQL
+function is written to match, reviewed for consistency, not a
+transactional guarantee in its own right; re-implementing the count/update
+in JS would reintroduce the exact race the DB-level lock exists to prevent.
+Keep both in sync if the algorithm ever changes.
 
 ## Build
 
@@ -320,28 +413,130 @@ Migrations so far:
   and `requests`, all workspace-scoped, all with RLS enabled and no
   anon/authenticated policies (same reasoning). See
   [RLS/security design](#database-security) below.
+- `*_create_approval_schema.sql` (M3) — adds `approval_policies` (one active
+  row per workspace/request-type, enforced via a partial unique index),
+  `approval_policy_members`, and `approvals` (immutable: no update trigger,
+  `unique(request_id, approver_id)`). RLS enabled, no anon/authenticated
+  policies.
+- `*_create_decide_on_request_function.sql` (M3) — the `decide_on_request()`
+  function described in [Atomic approval design](#atomic-approval-design).
+  Explicitly revokes the default Postgres `PUBLIC` execute grant and
+  re-grants only to `service_role`.
 
-**Migrations have not been pushed to the linked remote project yet** — they
-exist locally only. Run `pnpm dlx supabase db push` when you're ready to
-apply them (or `pnpm dlx supabase start` to try them against a local
-Postgres instance first, if Docker is running).
+**M3's two new migrations have not been pushed to the linked remote project
+yet** — they exist locally only, same as M2's were before you pushed them.
+Run `pnpm dlx supabase db push` when you're ready to apply them (or
+`pnpm dlx supabase start` against a local Postgres instance first, if
+Docker is running). I did not run this myself.
 
 ## Database security
 
-`users`, `request_types`, and `requests` hold application data scoped to a
+`users`, `request_types`, `requests`, `approval_policies`,
+`approval_policy_members`, and `approvals` hold application data scoped to a
 Slack workspace — none of it should be reachable by the public anon key.
-All three (plus `workspaces`, retroactively) have RLS **enabled with zero
+All of them (plus `workspaces`, retroactively) have RLS **enabled with zero
 policies**. With RLS on and no policies, Postgres denies all access to the
 `anon` and `authenticated` roles by default — only the service-role client
-(`src/lib/supabase/admin.ts`, used exclusively by the two M2 routes) can
-read or write these tables, since the service role bypasses RLS entirely.
+(`src/lib/supabase/admin.ts`) or the `decide_on_request()` function can read
+or write these tables.
 
-This is a deliberate choice, not a placeholder: M2 has no user-facing
-Supabase client anywhere (no browser code queries Supabase directly), so
-there's nothing that currently needs an RLS policy. If a future milestone
-adds a dashboard or any other client that queries Supabase directly with
-the anon/authenticated key, add narrowly-scoped policies at that point —
-don't open these tables by default.
+This is a deliberate choice, not a placeholder: there is no user-facing
+Supabase client anywhere in this app (no browser code queries Supabase
+directly), so there's nothing that currently needs an RLS policy. If a
+future milestone adds a dashboard or any other client that queries Supabase
+directly with the anon/authenticated key, add narrowly-scoped policies at
+that point — don't open these tables by default.
+
+### `decide_on_request()` function privileges
+
+Postgres grants `EXECUTE` on newly created functions to `PUBLIC` by
+default — that default was not assumed safe. The migration explicitly
+`REVOKE`s it (and from `anon`/`authenticated` individually, for clarity) and
+grants `EXECUTE` only to `service_role`, the only role that ever calls it
+(`src/lib/requests/approval-actions.ts`, itself only called from
+server-side routes). The function is `SECURITY DEFINER` with
+`SET search_path = pg_catalog, public` pinned explicitly, which forecloses
+a search-path-hijacking attack (the classic risk with `SECURITY DEFINER`
+functions that don't pin their search path). All authorization inside the
+function operates on internal UUIDs already resolved server-side from the
+trusted, signature-verified Slack payload — it never receives or trusts a
+client-supplied workspace/user identifier directly.
+
+## No active policy behavior
+
+If a request's type has no active approval policy, the request is **left
+`PENDING` with no notification sent** — never auto-approved. This is
+logged at info level (`console.log`, not `console.error`, since it's a
+valid/expected state, not a failure) with only internal IDs (workspace id,
+request type id, request id) — no Slack tokens, no user-identifying
+content. See `src/lib/requests/notify-approvers.ts`. Configure a policy
+with `scripts/configure-approval-policy.ts` (above) to unstick it — M3 has
+no mechanism to retroactively notify approvers for a request that was
+already created before a policy existed; that would need a manual
+`decide_on_request` call or a future milestone's tooling.
+
+## Notification/decision delivery failures
+
+Database state is authoritative; Slack API calls are always best-effort
+follow-ups, never a condition for correctness:
+
+- If sending an approver DM fails (`notify-approvers.ts`), it's logged
+  (sanitized: `error.message` only, never a token or full API response) and
+  the other approvers are still notified — one failure doesn't cancel the
+  rest, and the already-created `PENDING` request is untouched either way.
+- If recording a decision (`decide_on_request` RPC) fails, the interactions
+  route logs it and acknowledges Slack with an empty 200 without touching
+  the request — no partial state, since the whole decision is one
+  transaction that either commits entirely or not at all.
+- If updating the Slack message after a successful decision fails (e.g. a
+  transient API error), the decision itself is unaffected — it was already
+  committed before the update was attempted. The approver's message may
+  keep showing stale buttons in that case; clicking them again is safe
+  (`decide_on_request` returns `already_decided`, not a second approval).
+
+M3 does not queue or retry failed Slack calls — this is a documented
+limitation, not an oversight, per the instruction not to introduce a queue
+unless absolutely necessary. A future milestone could add retries if this
+becomes a real problem in practice.
+
+## Multi-approver behavior
+
+With `required_approvals = 2` and members Gary + Mike: both are DMed when
+the request is created. Gary approving alone leaves the request `PENDING`
+(Gary's own message updates to "🟡 Your approval was recorded. Waiting for
+1 more approval."). Mike approving next transitions it to `APPROVED` (Mike's
+message shows "✅ Request approved."). If either rejects at any point before
+the request is final, it becomes `REJECTED` immediately regardless of prior
+approvals. Only the *clicking* approver's own DM is updated at the moment
+of their click — M3 does not proactively push an update to other approvers'
+copies of the message when a *different* approver's click finalizes the
+request (that would need storing every approver's channel/message
+reference and fanning out extra Slack calls, which isn't implemented). If
+an approver with a stale-looking message clicks it after the fact, the RPC
+safely returns `already_final` and their message is updated to reflect the
+real final status — no double-decision, just a slightly delayed reconciliation.
+
+## User display names
+
+`users.display_name` is never populated automatically (no `users:read`
+scope is requested, and M3 doesn't add one just for this). Approver/requester
+mentions in Slack messages use `display_name` when set, otherwise fall back
+to `<@SLACK_USER_ID>` — Slack renders that as a proper name/avatar mention
+client-side regardless, so the fallback looks correct without needing any
+additional scope. See `formatUserMention()` in
+`src/lib/requests/build-approval-notification.ts`.
+
+## M3 end-to-end testing procedure
+
+1. Push the two new M3 migrations: `pnpm dlx supabase db push` (not run by me — see [Supabase local development](#supabase-local-development)).
+2. Reinstall the Slack app (`/api/slack/install`) so its token includes the new `chat:write` scope.
+3. Run `/request` once in the workspace if you haven't already since the request types were added — this seeds the 5 default `request_types` rows.
+4. Configure a policy: `node --experimental-strip-types --env-file=.env.local scripts/configure-approval-policy.ts --team <T...> --request-type production_access --name "Test Policy" --required 1 --approver <your own Slack user ID>` (use `--required 1` and yourself as the sole approver for the simplest first test).
+5. Run `/request`, submit a Production Access request.
+6. You should receive a DM with the request details and Approve/Reject buttons.
+7. Click Approve — the message should update to "✅ Request approved." (since required_approvals=1), and the `requests` row's `status` should be `APPROVED`.
+8. Click the same button again (or have Slack redeliver) — should be a safe no-op (`already_decided`), not a duplicate `approvals` row.
+9. For multi-approver testing, reconfigure with `--required 2` and two different `--approver` Slack IDs, then repeat: first approval should leave the request `PENDING`, second should transition it to `APPROVED`; a rejection at any point should transition it to `REJECTED` immediately.
 
 ## Project structure
 
@@ -372,17 +567,28 @@ src/
       verify-request.ts           # pure: Slack request signature verification (unit tested)
       verify-request.test.ts
     requests/
-      duration-options.ts         # pure: shared duration select options
+      duration-options.ts         # pure: shared duration select options + labels
       request-types.ts            # server-only: default request types + idempotent seeding
       workspace-lookup.ts         # server-only: workspace/user lookup+upsert
       build-request-modal.ts      # pure: Block Kit modal builder
       validate-request-submission.ts  # pure: view_submission validation (unit tested)
       validate-request-submission.test.ts
+      build-approval-notification.ts  # pure: approver DM builder, message update, outcome text
+      parse-block-action.ts       # pure: block_actions (Approve/Reject) validation (unit tested)
+      parse-block-action.test.ts
+      compute-decision-outcome.ts # pure mirror of decide_on_request()'s algorithm (unit tested)
+      compute-decision-outcome.test.ts
+      approval-actions.ts         # server-only: decide_on_request() RPC wrapper
+      notify-approvers.ts         # server-only: resolves policy+members, sends DMs
     supabase/
       admin.ts                    # server-only: service-role Supabase client
   types/
     workspace.ts                  # Workspace row type
     request.ts                    # User, RequestType, RequestRow types
+    approval.ts                   # ApprovalPolicy, Approval, DecideOnRequestResult types
+
+scripts/
+  configure-approval-policy.ts    # admin CLI: assign approvers to a request type (not an HTTP endpoint)
 
 supabase/
   config.toml
@@ -391,4 +597,6 @@ supabase/
     *_add_slack_installation_to_workspaces.sql
     *_enable_workspaces_rls.sql
     *_create_request_data_model.sql
+    *_create_approval_schema.sql
+    *_create_decide_on_request_function.sql
 ```

@@ -6,20 +6,23 @@ import { serverEnv } from "@/lib/env.server";
 import { deriveOAuthStateSecret } from "@/lib/slack/state-secret";
 
 /**
- * Bot scopes requested during Slack OAuth installation.
+ * Bot scopes requested during Slack OAuth installation. Keep this to the
+ * minimum needed for shipped features — do not add scopes for anything
+ * that isn't implemented yet.
  *
- * Keep this to the minimum needed for M1 (installation) plus the one
- * near-term M2 feature we already know is coming. Do not add scopes for
- * features that aren't implemented yet.
+ * - `commands` — required to receive the payload for the `/request` slash
+ *   command (M2).
+ * - `chat:write` — required to DM approvers and update those messages after
+ *   a decision (M3). `conversations.open` + `im:write` is NOT used: per
+ *   Slack's own `chat.postMessage` reference, passing a user ID directly as
+ *   `channel` opens a DM automatically and needs only `chat:write` — no
+ *   `im:write`/`mpim:write`/`channels:manage` (the scopes `conversations.open`
+ *   itself would require). See src/lib/requests/notify-approvers.ts.
  *
- * - `commands` — required to receive the payload for the future `/request`
- *   slash command (M2). No bot scope is strictly required to complete
- *   installation alone, but Slack's OAuth v2 endpoint requires at least one
- *   bot scope to issue a bot token, so we anchor on the scope we already
- *   know we need next rather than requesting something broader "just in
- *   case".
+ * Adding a scope after the app was already installed requires reinstalling
+ * — see README "Slack app setup".
  */
-export const SLACK_BOT_SCOPES = ["commands"] as const;
+export const SLACK_BOT_SCOPES = ["commands", "chat:write"] as const;
 
 function getAppUrl(): string {
   const appUrl = serverEnv.NEXT_PUBLIC_APP_URL;

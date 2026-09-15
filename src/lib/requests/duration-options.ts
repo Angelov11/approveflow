@@ -29,3 +29,12 @@ export function resolveDurationMinutes(value: string): number | null | undefined
   const option = DURATION_OPTIONS.find((candidate) => candidate.value === value);
   return option ? option.minutes : undefined;
 }
+
+/** Human label for a stored `requested_duration_minutes` value, reusing the exact labels offered in the modal. */
+export function formatDurationLabel(minutes: number | null): string {
+  if (minutes === null) {
+    return "Not applicable";
+  }
+  const match = DURATION_OPTIONS.find((option) => option.minutes === minutes);
+  return match ? match.label : `${minutes} minutes`;
+}
