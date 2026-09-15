@@ -6,10 +6,17 @@ import type { NextRequest } from "next/server";
 import { serverEnv } from "@/lib/env.server";
 import { decideOnRequest } from "@/lib/requests/approval-actions";
 import { findActivePolicyForRequestType, listPolicyRecipients } from "@/lib/requests/approval-policies";
-import { describeDecisionOutcome, replaceActionsWithStatus, APPROVE_ACTION_ID, REJECT_ACTION_ID } from "@/lib/requests/build-approval-notification";
+import { buildApprovalNotification, describeDecisionOutcome, replaceActionsWithStatus, APPROVE_ACTION_ID, REJECT_ACTION_ID } from "@/lib/requests/build-approval-notification";
+import {
+  APPROVE_DECISION_CALLBACK_ID,
+  buildDecisionModal,
+  REJECT_DECISION_CALLBACK_ID,
+  type DecisionModalSource,
+} from "@/lib/requests/build-decision-modal";
 import { buildRequestModal, REQUEST_MODAL_CALLBACK_ID } from "@/lib/requests/build-request-modal";
 import { buildErrorView, buildRequestCenterView, buildRequestDetailsView, buildWaitingListView, type ModalView } from "@/lib/requests/build-requests-views";
 import { isFinalDecisionTransition } from "@/lib/requests/build-requester-decision-notification";
+import { formatDurationLabel } from "@/lib/requests/duration-options";
 import { notifyApprovers, type NotificationRecipient } from "@/lib/requests/notify-approvers";
 import { notifyRequesterOfDecision } from "@/lib/requests/notify-requester";
 import { parseApprovalBlockAction, type BlockActionsPayload } from "@/lib/requests/parse-block-action";
@@ -23,16 +30,23 @@ import {
 } from "@/lib/requests/parse-requests-action";
 import { getRequestDetails, listRequestsByRequester, listRequestsWaitingForApprover } from "@/lib/requests/request-views";
 import { ensureDefaultRequestTypes, listActiveRequestTypes } from "@/lib/requests/request-types";
+import { validateDecisionSubmission, type DecisionSubmissionPayload } from "@/lib/requests/validate-decision-submission";
 import { validateRequestSubmission, type ViewSubmissionPayload } from "@/lib/requests/validate-request-submission";
 import { findWorkspaceBySlackTeamId, upsertSlackUser } from "@/lib/requests/workspace-lookup";
 import { decryptBotToken } from "@/lib/slack/token-encryption";
 import { isValidSlackRequest } from "@/lib/slack/verify-request";
 import { getSupabaseAdmin } from "@/lib/supabase/admin";
+import type { Decision } from "@/types/approval";
 
 const POSTGRES_UNIQUE_VIOLATION = "23505";
 
 function modalErrors(errors: Record<string, string>) {
   return Response.json({ response_action: "errors", errors });
+}
+
+/** Replaces the currently-open view in place — used to show a small result/error view after a decision modal submission that couldn't be applied (already decided, unauthorized, etc.), rather than silently closing and doing nothing. */
+function modalUpdate(view: ModalView) {
+  return Response.json({ response_action: "update", view });
 }
 
 const ack = () => new Response(null, { status: 200 });
@@ -56,7 +70,7 @@ export async function POST(request: NextRequest) {
     return ack();
   }
 
-  let payload: { type?: string; actions?: { action_id?: string }[] };
+  let payload: { type?: string; actions?: { action_id?: string }[]; view?: { callback_id?: string } };
   try {
     payload = JSON.parse(rawPayload);
   } catch {
@@ -66,7 +80,7 @@ export async function POST(request: NextRequest) {
   if (payload.type === "block_actions") {
     const actionId = payload.actions?.[0]?.action_id;
     if (actionId === APPROVE_ACTION_ID || actionId === REJECT_ACTION_ID) {
-      return handleApprovalAction(payload as BlockActionsPayload);
+      return handleOpenDecisionModal(payload as BlockActionsPayload, actionId === APPROVE_ACTION_ID ? "APPROVED" : "REJECTED");
     }
     if (
       actionId === VIEW_REQUEST_ACTION_ID ||
@@ -80,7 +94,18 @@ export async function POST(request: NextRequest) {
     return ack();
   }
 
-  return handleRequestSubmission(payload as ViewSubmissionPayload);
+  if (payload.type === "view_submission") {
+    const callbackId = payload.view?.callback_id;
+    if (callbackId === REQUEST_MODAL_CALLBACK_ID) {
+      return handleRequestSubmission(payload as ViewSubmissionPayload);
+    }
+    if (callbackId === APPROVE_DECISION_CALLBACK_ID || callbackId === REJECT_DECISION_CALLBACK_ID) {
+      return handleDecisionSubmission(payload as DecisionSubmissionPayload, callbackId === REJECT_DECISION_CALLBACK_ID ? "REJECTED" : "APPROVED");
+    }
+    return ack();
+  }
+
+  return ack();
 }
 
 async function handleRequestSubmission(payload: ViewSubmissionPayload): Promise<Response> {
@@ -199,28 +224,140 @@ async function handleRequestSubmission(payload: ViewSubmissionPayload): Promise<
   return ack();
 }
 
-async function handleApprovalAction(payload: BlockActionsPayload): Promise<Response> {
+/**
+ * M7: an Approve/Reject click no longer decides anything itself — it only
+ * opens a small modal (optional Comment for Approve, required Reason for
+ * Reject) via the click's own trigger_id. Opening this modal grants no
+ * authorization at all; the actual decision only happens in
+ * handleDecisionSubmission below, which independently re-resolves and
+ * re-authorizes through decide_on_request(). The click's `source` (message
+ * vs. modal origin) travels forward via the decision modal's
+ * private_metadata purely so the outcome can be reflected in the right
+ * place afterward — never as an authorization signal.
+ */
+async function handleOpenDecisionModal(payload: BlockActionsPayload, decision: Decision): Promise<Response> {
   const parsed = parseApprovalBlockAction(payload);
   if (!parsed.ok) {
     // Not one of our recognized actions, or malformed — ignore safely.
     return ack();
   }
-  const { slackTeamId, slackUserId, actionId, requestId, source } = parsed.data;
+  const { slackTeamId, triggerId, requestId, source } = parsed.data;
 
   const workspace = await findWorkspaceBySlackTeamId(slackTeamId);
   if (!workspace) {
     return ack();
   }
 
-  const approver = await upsertSlackUser(workspace.id, slackUserId);
-  const decision = actionId === "approve_request" ? "APPROVED" : "REJECTED";
+  try {
+    // Only the minimum locator needed to reflect the outcome later — never
+    // the original message/view blocks, which could push private_metadata
+    // over Slack's 3000-character limit for a request with a long
+    // resource/reason (see build-decision-modal.ts).
+    const modalSource: DecisionModalSource =
+      source.type === "message"
+        ? { type: "message", channelId: source.channelId, messageTs: source.messageTs }
+        : { type: "modal", viewId: source.viewId };
 
+    const view = buildDecisionModal({ decision, requestId, source: modalSource });
+
+    const botToken = decryptBotToken({
+      ciphertext: workspace.bot_access_token_ciphertext,
+      iv: workspace.bot_access_token_iv,
+      authTag: workspace.bot_access_token_auth_tag,
+    });
+    const client = new WebClient(botToken);
+
+    // Message-origin: no modal is open yet, so this is a fresh top-level
+    // modal (views.open). Modal-origin (M5 Request Details): stack the
+    // decision modal on top of it (views.push) — Cancel then naturally
+    // returns to Request Details, same convention as M6's origin-based
+    // open/push branching.
+    if (source.type === "modal") {
+      await client.views.push({ trigger_id: triggerId, view } as Parameters<typeof client.views.push>[0]);
+    } else {
+      await client.views.open({ trigger_id: triggerId, view } as Parameters<typeof client.views.open>[0]);
+    }
+  } catch (error) {
+    console.error("Failed to open decision modal:", error instanceof Error ? error.message : "unknown error");
+  }
+
+  return ack();
+}
+
+/**
+ * Rebuilds the original approver DM's content fresh from the (immutable)
+ * request row, rather than relying on blocks carried through
+ * private_metadata — deterministic given the same request, and reused
+ * verbatim with replaceActionsWithStatus exactly like the pre-M7 flow did
+ * with the payload-echoed blocks. Workspace-scoped: returns null (not an
+ * error) for a request that doesn't exist or belongs to a different
+ * workspace, same safety posture as getRequestDetails.
+ */
+async function rebuildApprovalMessageContent(workspaceId: string, requestId: string) {
+  const supabase = getSupabaseAdmin();
+  const { data: request, error } = await supabase
+    .from("requests")
+    .select("resource, reason, requested_duration_minutes, request_types(name), users!requests_requester_id_fkey(slack_user_id)")
+    .eq("id", requestId)
+    .eq("workspace_id", workspaceId)
+    .maybeSingle();
+
+  if (error || !request) {
+    return null;
+  }
+
+  const requestType = Array.isArray(request.request_types) ? request.request_types[0] : request.request_types;
+  const requester = Array.isArray(request.users) ? request.users[0] : request.users;
+
+  return buildApprovalNotification({
+    requestId,
+    requestTypeName: requestType?.name ?? "Unknown request type",
+    requester: { slack_user_id: requester?.slack_user_id ?? "unknown", display_name: null },
+    resource: request.resource,
+    reason: request.reason,
+    durationLabel: formatDurationLabel(request.requested_duration_minutes),
+  });
+}
+
+const DECISION_NOT_APPLIED_OUTCOMES = new Set(["not_found", "already_final", "unauthorized", "already_decided", "no_policy"]);
+
+/**
+ * The security-critical step (M7): submitting the decision modal does NOT
+ * assume the user is still authorized just because they successfully
+ * opened it. Workspace/user identity is re-resolved from the signed
+ * `payload.team`/`payload.user` envelope (never from private_metadata),
+ * and decide_on_request() independently re-authorizes from scratch —
+ * this matters most for POLICY routing, where membership is live: someone
+ * removed from a policy between opening and submitting this modal is
+ * rejected here exactly as if they'd never opened it.
+ */
+async function handleDecisionSubmission(payload: DecisionSubmissionPayload, decision: Decision): Promise<Response> {
+  const parsed = validateDecisionSubmission(payload, decision);
+  if (!parsed.ok) {
+    return modalErrors(parsed.errors);
+  }
+  const { slackTeamId, slackUserId, requestId, source, comment } = parsed.data;
+
+  const workspace = await findWorkspaceBySlackTeamId(slackTeamId);
+  if (!workspace) {
+    return modalUpdate(buildErrorView("ApproveFlow isn't installed for this workspace anymore."));
+  }
+
+  let approverId: string;
   let result;
   try {
-    result = await decideOnRequest({ requestId, approverId: approver.id, decision });
+    const approver = await upsertSlackUser(workspace.id, slackUserId);
+    approverId = approver.id;
+    result = await decideOnRequest({ requestId, approverId, decision, comment });
   } catch (error) {
-    console.error("Failed to record approval decision:", error instanceof Error ? error.message : "unknown error");
-    return ack();
+    console.error("Failed to record decision:", error instanceof Error ? error.message : "unknown error");
+    return modalUpdate(buildErrorView("Something went wrong recording your decision. Please try again."));
+  }
+
+  if (DECISION_NOT_APPLIED_OUTCOMES.has(result.outcome)) {
+    // Authorization/conflict outcome — nothing was recorded. Tell the user
+    // why instead of silently closing the modal as if it had worked.
+    return modalUpdate(buildErrorView(describeDecisionOutcome(result)));
   }
 
   // Best-effort: reflect the outcome where the click came from. A failure
@@ -238,16 +375,19 @@ async function handleApprovalAction(payload: BlockActionsPayload): Promise<Respo
     const statusText = describeDecisionOutcome(result);
 
     if (source.type === "message") {
-      await client.chat.update(
-        {
-          channel: source.channelId,
-          ts: source.messageTs,
-          text: statusText,
-          blocks: replaceActionsWithStatus(source.messageBlocks, statusText),
-        } as Parameters<typeof client.chat.update>[0],
-      );
+      const rebuilt = await rebuildApprovalMessageContent(workspace.id, requestId);
+      if (rebuilt) {
+        await client.chat.update(
+          {
+            channel: source.channelId,
+            ts: source.messageTs,
+            text: statusText,
+            blocks: replaceActionsWithStatus(rebuilt.blocks, statusText),
+          } as Parameters<typeof client.chat.update>[0],
+        );
+      }
     } else {
-      const details = await getRequestDetails(workspace.id, requestId, approver.id);
+      const details = await getRequestDetails(workspace.id, requestId, approverId);
       const view = details ? buildRequestDetailsView({ details, banner: statusText }) : buildErrorView("This request could not be found.");
       await client.views.update({ view_id: source.viewId, view } as Parameters<typeof client.views.update>[0]);
     }
@@ -259,7 +399,7 @@ async function handleApprovalAction(payload: BlockActionsPayload): Promise<Respo
   // caused a final transition — never for retries/duplicates/already-final
   // requests/unauthorized attempts/intermediate policy approvals. Gating on
   // the RPC's own outcome (rather than e.g. re-checking request status)
-  // means a Slack HTTP retry of the same click — which decide_on_request
+  // means a Slack HTTP retry of the same submission — which decide_on_request
   // reports as "already_decided" — can never trigger a second notification.
   if (isFinalDecisionTransition(result.outcome)) {
     try {
@@ -274,6 +414,9 @@ async function handleApprovalAction(payload: BlockActionsPayload): Promise<Respo
     }
   }
 
+  // Empty body closes the decision modal — if it was pushed onto Request
+  // Details, this pops back to that (now-updated) view underneath, same as
+  // clicking Cancel would.
   return ack();
 }
 

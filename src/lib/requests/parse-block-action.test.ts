@@ -9,6 +9,7 @@ function buildMessagePayload(overrides: Partial<{ actionId: string; value: strin
     type: "block_actions",
     team: { id: "T123" },
     user: { id: "U123" },
+    trigger_id: "trigger-1",
     channel: { id: "C123" },
     message: { ts: "1234.5678", blocks: [{ type: "section" }] },
     actions: [{ action_id: actionId, value }],
@@ -21,6 +22,7 @@ function buildModalPayload(overrides: Partial<{ actionId: string; value: string 
     type: "block_actions",
     team: { id: "T123" },
     user: { id: "U123" },
+    trigger_id: "trigger-1",
     view: { id: "V123", blocks: [{ type: "section" }] },
     actions: [{ action_id: actionId, value }],
   };
@@ -34,7 +36,18 @@ test("valid approve action from a message is recognized", () => {
   if (result.ok) {
     assert.equal(result.data.actionId, APPROVE_ACTION_ID);
     assert.equal(result.data.requestId, "req-1");
+    assert.equal(result.data.triggerId, "trigger-1");
     assert.deepEqual(result.data.source, { type: "message", channelId: "C123", messageTs: "1234.5678", messageBlocks: [{ type: "section" }] });
+  }
+});
+
+test("missing trigger_id is rejected safely (needed to open the M7 decision modal)", () => {
+  const payload = buildMessagePayload();
+  delete payload.trigger_id;
+  const result = parseApprovalBlockAction(payload);
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.equal(result.reason, "missing_identifiers");
   }
 });
 

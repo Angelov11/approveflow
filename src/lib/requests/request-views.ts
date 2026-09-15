@@ -175,7 +175,7 @@ export async function getRequestDetails(workspaceId: string, requestId: string, 
       : Promise.resolve({ data: null, error: null }),
     supabase
       .from("approvals")
-      .select("decision, users(slack_user_id)")
+      .select("decision, comment, users(slack_user_id)")
       .eq("request_id", requestId)
       .order("decided_at", { ascending: true }),
   ]);
@@ -186,7 +186,7 @@ export async function getRequestDetails(workspaceId: string, requestId: string, 
 
   const decisions = (decisionsResult.data ?? []).map((row) => {
     const user = Array.isArray(row.users) ? row.users[0] : row.users;
-    return { slackUserId: user?.slack_user_id ?? "unknown", decision: row.decision as "APPROVED" | "REJECTED" };
+    return { slackUserId: user?.slack_user_id ?? "unknown", decision: row.decision as "APPROVED" | "REJECTED", comment: row.comment };
   });
 
   let routing: RequestDetailsView["routing"];

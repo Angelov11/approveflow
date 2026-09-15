@@ -17,6 +17,7 @@ export interface BlockActionsPayload {
   type: string;
   team?: { id?: string };
   user?: { id?: string };
+  trigger_id?: string;
   actions?: { action_id?: string; value?: string }[];
   channel?: { id?: string };
   message?: { ts?: string; blocks?: unknown[] };
@@ -32,6 +33,8 @@ export interface ParsedApprovalAction {
   slackUserId: string;
   actionId: typeof APPROVE_ACTION_ID | typeof REJECT_ACTION_ID;
   requestId: string;
+  /** Needed to open the M7 decision modal (views.open/views.push) — valid for only a few seconds, so it's used immediately, never persisted. */
+  triggerId: string;
   /** Where to reflect the outcome: chat.update on a message, or views.update on a modal. */
   source: ApprovalActionSource;
 }
@@ -44,11 +47,17 @@ export type ParseBlockActionResult = { ok: true; data: ParsedApprovalAction } | 
  * request this click refers to; the interactions route re-resolves
  * workspace/user from the trusted payload envelope and defers all
  * authorization to decide_on_request() — identical regardless of origin.
+ *
+ * As of M7, this click no longer decides anything itself — it only opens a
+ * decision modal (see build-decision-modal.ts), so a `trigger_id` is
+ * required here too, exactly like every other view-opening interaction in
+ * this app.
  */
 export function parseApprovalBlockAction(payload: BlockActionsPayload): ParseBlockActionResult {
   const slackTeamId = payload.team?.id;
   const slackUserId = payload.user?.id;
-  if (!slackTeamId || !slackUserId) {
+  const triggerId = payload.trigger_id;
+  if (!slackTeamId || !slackUserId || !triggerId) {
     return { ok: false, reason: "missing_identifiers" };
   }
 
@@ -76,6 +85,7 @@ export function parseApprovalBlockAction(payload: BlockActionsPayload): ParseBlo
         slackUserId,
         actionId: action.action_id,
         requestId,
+        triggerId,
         source: {
           type: "message",
           channelId: payload.channel.id,
@@ -94,6 +104,7 @@ export function parseApprovalBlockAction(payload: BlockActionsPayload): ParseBlo
         slackUserId,
         actionId: action.action_id,
         requestId,
+        triggerId,
         source: { type: "modal", viewId: payload.view.id, viewBlocks: payload.view.blocks ?? [] },
       },
     };

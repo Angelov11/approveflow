@@ -18,6 +18,7 @@ const baseParams = {
   durationLabel: "2 hours",
   routingType: "DIRECT" as const,
   decidingApproverSlackId: "U0APPROVER1",
+  comment: null,
 };
 
 // --- isFinalDecisionTransition: the sole notification gate ---
@@ -83,4 +84,45 @@ test("message always includes request type, resource, duration, and status", () 
   assert.ok(texts.some((t) => t.includes("AWS Test Resource")));
   assert.ok(texts.some((t) => t.includes("2 hours")));
   assert.ok(texts.some((t) => t.includes("APPROVED")));
+});
+
+// --- M7: decision comment/reason rendering ---
+
+function blockText(content: ReturnType<typeof buildRequesterDecisionNotification>, index: number): string {
+  return JSON.stringify(content.blocks[index]);
+}
+
+test("DIRECT approved with a comment includes a Comment section", () => {
+  const content = buildRequesterDecisionNotification({ ...baseParams, decision: "APPROVED", routingType: "DIRECT", comment: "Looks good — temporary access approved." });
+  assert.equal(content.blocks.length, 3);
+  assert.ok(blockText(content, 2).includes("*Comment:*"));
+  assert.ok(blockText(content, 2).includes("Looks good — temporary access approved."));
+});
+
+test("DIRECT approved without a comment renders no Comment section at all", () => {
+  const content = buildRequesterDecisionNotification({ ...baseParams, decision: "APPROVED", routingType: "DIRECT", comment: null });
+  assert.equal(content.blocks.length, 2);
+  assert.ok(!JSON.stringify(content.blocks).includes("Comment"));
+});
+
+test("DIRECT rejected with a reason includes a Reason section, not 'Comment'", () => {
+  const content = buildRequesterDecisionNotification({ ...baseParams, decision: "REJECTED", routingType: "DIRECT", comment: "Please use staging instead." });
+  assert.ok(blockText(content, 2).includes("*Reason:*"));
+  assert.ok(blockText(content, 2).includes("Please use staging instead."));
+  assert.ok(!blockText(content, 2).includes("*Comment:*"));
+});
+
+test("POLICY final approval's comment is labeled generically — never implying the final clicker alone approved it", () => {
+  const content = buildRequesterDecisionNotification({ ...baseParams, decision: "APPROVED", routingType: "POLICY", comment: "Looks good from security." });
+  const text = blockText(content, 2);
+  assert.ok(text.includes("Final approval comment"));
+  assert.ok(!text.includes("Approved by"));
+  assert.ok(text.includes("Looks good from security."));
+});
+
+test("POLICY rejection attributes the rejector and shows the reason", () => {
+  const content = buildRequesterDecisionNotification({ ...baseParams, decision: "REJECTED", routingType: "POLICY", comment: "Budget owner approval is missing." });
+  assert.ok(fieldTexts(content).some((t) => t.includes("Rejected by") && t.includes("<@U0APPROVER1>")));
+  assert.ok(blockText(content, 2).includes("*Reason:*"));
+  assert.ok(blockText(content, 2).includes("Budget owner approval is missing."));
 });

@@ -14,12 +14,15 @@ export async function decideOnRequest(params: {
   requestId: string;
   approverId: string;
   decision: Decision;
+  /** Optional for APPROVED, required for REJECTED — enforced authoritatively by the RPC itself, not here. */
+  comment?: string | null;
 }): Promise<DecideOnRequestResult> {
   const supabase = getSupabaseAdmin();
   const { data, error } = await supabase.rpc("decide_on_request", {
     p_request_id: params.requestId,
     p_approver_id: params.approverId,
     p_decision: params.decision,
+    p_comment: params.comment ?? null,
   });
 
   if (error) {

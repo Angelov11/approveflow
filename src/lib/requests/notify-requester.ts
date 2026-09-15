@@ -55,9 +55,21 @@ export async function notifyRequesterOfDecision({
     return;
   }
 
-  const [requesterResult, requestTypeResult] = await Promise.all([
+  const [requesterResult, requestTypeResult, decisionCommentResult] = await Promise.all([
     supabase.from("users").select("slack_user_id").eq("id", request.requester_id).single(),
     supabase.from("request_types").select("name").eq("id", request.request_type_id).single(),
+    // The comment belonging to THIS final transition: the (unique) REJECTED
+    // row for a rejection, or the most recent APPROVED row for an approval
+    // — the one that just crossed the required threshold, which for DIRECT
+    // is also the only row that will ever exist.
+    supabase
+      .from("approvals")
+      .select("comment")
+      .eq("request_id", requestId)
+      .eq("decision", decision)
+      .order("decided_at", { ascending: false })
+      .limit(1)
+      .maybeSingle(),
   ]);
 
   if (requesterResult.error || !requesterResult.data) {
@@ -66,6 +78,10 @@ export async function notifyRequesterOfDecision({
   }
   if (requestTypeResult.error || !requestTypeResult.data) {
     console.error("Failed to resolve request type for notification:", requestTypeResult.error?.message ?? "not found");
+    return;
+  }
+  if (decisionCommentResult.error) {
+    console.error("Failed to resolve decision comment for notification:", decisionCommentResult.error.message);
     return;
   }
 
@@ -88,6 +104,7 @@ export async function notifyRequesterOfDecision({
     durationLabel: formatDurationLabel(request.requested_duration_minutes),
     routingType: request.routing_type,
     decidingApproverSlackId,
+    comment: decisionCommentResult.data?.comment ?? null,
   });
 
   const client = new WebClient(botToken);

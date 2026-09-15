@@ -97,11 +97,53 @@ test("DIRECT pending shows the approver as pending", () => {
 
 test("DIRECT decided shows the recorded decision, not 'pending'", () => {
   const view = buildRequestDetailsView({
-    details: { ...baseDetails, status: "APPROVED", decisions: [{ slackUserId: "U0APPROVER", decision: "APPROVED" }] },
+    details: { ...baseDetails, status: "APPROVED", decisions: [{ slackUserId: "U0APPROVER", decision: "APPROVED", comment: null }] },
   });
   const text = blocksToText(view);
   assert.ok(text.includes("✅ <@U0APPROVER> approved"));
   assert.ok(!text.includes("pending"));
+});
+
+test("DIRECT approval with a comment shows the comment beneath the decision", () => {
+  const view = buildRequestDetailsView({
+    details: {
+      ...baseDetails,
+      status: "APPROVED",
+      decisions: [{ slackUserId: "U0APPROVER", decision: "APPROVED", comment: "Looks good — temporary access approved." }],
+    },
+  });
+  const text = blocksToText(view);
+  assert.ok(text.includes("✅ <@U0APPROVER> approved"));
+  assert.ok(text.includes("Looks good — temporary access approved."));
+});
+
+test("DIRECT rejection shows the reason, labeled distinctly from an approval comment", () => {
+  const view = buildRequestDetailsView({
+    details: {
+      ...baseDetails,
+      status: "REJECTED",
+      decisions: [{ slackUserId: "U0APPROVER", decision: "REJECTED", comment: "Please use staging instead." }],
+    },
+  });
+  const text = blocksToText(view);
+  assert.ok(text.includes("❌ <@U0APPROVER> rejected"));
+  assert.ok(text.includes("Reason:"));
+  assert.ok(text.includes("Please use staging instead."));
+});
+
+test("a historical decision with no comment renders with no comment line at all — no 'No comment provided' placeholder", () => {
+  const view = buildRequestDetailsView({
+    details: { ...baseDetails, status: "REJECTED", decisions: [{ slackUserId: "U0APPROVER", decision: "REJECTED", comment: null }] },
+  });
+  // Scoped to the "Approver" block specifically — the request's own free-text
+  // "Reason" field (baseDetails.reason) is unrelated and always renders its
+  // own "*Reason:*" label elsewhere in the view.
+  const approverBlock = (view.blocks as { text?: { text?: string } }[]).find((b) => b.text?.text?.includes("*Approver*"));
+  const approverText = approverBlock?.text?.text ?? "";
+  assert.ok(approverText.includes("❌ <@U0APPROVER> rejected"));
+  assert.ok(!approverText.includes("Reason:"));
+  assert.ok(!approverText.includes("No comment"));
+  assert.ok(!approverText.includes("No reason"));
 });
 
 test("POLICY shows the policy name, approval count, historical decisions, and current pending members", () => {
@@ -113,7 +155,7 @@ test("POLICY shows the policy name, approval count, historical decisions, and cu
       requiredApprovals: 2,
       pendingMemberSlackUserIds: ["U0MIKE"],
     },
-    decisions: [{ slackUserId: "U0GARY", decision: "APPROVED" }],
+    decisions: [{ slackUserId: "U0GARY", decision: "APPROVED", comment: null }],
   };
   const text = blocksToText(buildRequestDetailsView({ details }));
   assert.ok(text.includes("Production Access Approval"));
@@ -122,11 +164,29 @@ test("POLICY shows the policy name, approval count, historical decisions, and cu
   assert.ok(text.includes("🟡 <@U0MIKE> pending"));
 });
 
+test("POLICY renders each approver's own comment against the correct approver", () => {
+  const details: RequestDetailsView = {
+    ...baseDetails,
+    routing: { type: "POLICY", policyName: "Production Access Approval", requiredApprovals: 2, pendingMemberSlackUserIds: [] },
+    decisions: [
+      { slackUserId: "U0ALICE", decision: "APPROVED", comment: "Looks good." },
+      { slackUserId: "U0BOB", decision: "APPROVED", comment: "No issues from security." },
+    ],
+  };
+  const text = blocksToText(buildRequestDetailsView({ details }));
+  const aliceIndex = text.indexOf("U0ALICE");
+  const aliceCommentIndex = text.indexOf("Looks good.");
+  const bobIndex = text.indexOf("U0BOB");
+  const bobCommentIndex = text.indexOf("No issues from security.");
+  assert.ok(aliceIndex < aliceCommentIndex && aliceCommentIndex < bobIndex);
+  assert.ok(bobIndex < bobCommentIndex);
+});
+
 test("a decision from someone no longer a policy member still renders (historical, not erased)", () => {
   const details: RequestDetailsView = {
     ...baseDetails,
     routing: { type: "POLICY", policyName: "Production Access Approval", requiredApprovals: 1, pendingMemberSlackUserIds: [] },
-    decisions: [{ slackUserId: "U0REMOVED", decision: "APPROVED" }],
+    decisions: [{ slackUserId: "U0REMOVED", decision: "APPROVED", comment: null }],
   };
   const text = blocksToText(buildRequestDetailsView({ details }));
   assert.ok(text.includes("✅ <@U0REMOVED> approved"));

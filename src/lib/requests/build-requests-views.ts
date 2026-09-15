@@ -36,6 +36,8 @@ export interface RequestSummary {
 export interface RequestDecisionRecord {
   slackUserId: string;
   decision: "APPROVED" | "REJECTED";
+  /** M7: optional for APPROVED, always non-null for REJECTED — except pre-M7 historical REJECTED rows, which have none and render with no comment line at all (never a fabricated "No reason provided" placeholder). */
+  comment: string | null;
 }
 
 /**
@@ -153,10 +155,15 @@ export function buildWaitingListView({ waitingRequests }: { waitingRequests: Req
   } as ModalView;
 }
 
+/** Never shows an empty "No comment provided" placeholder — a comment line only appears when one actually exists (always true for post-M7 rejections; optional everywhere else, including all pre-M7 historical decisions). */
 function decisionLine(record: RequestDecisionRecord): string {
   const icon = record.decision === "APPROVED" ? "✅" : "❌";
   const verb = record.decision === "APPROVED" ? "approved" : "rejected";
-  return `${icon} <@${record.slackUserId}> ${verb}`;
+  const line = `${icon} <@${record.slackUserId}> ${verb}`;
+  if (!record.comment) {
+    return line;
+  }
+  return record.decision === "REJECTED" ? `${line}\nReason: "${record.comment}"` : `${line}\n"${record.comment}"`;
 }
 
 export interface BuildRequestDetailsViewParams {

@@ -36,6 +36,14 @@ export interface BuildRequesterDecisionNotificationParams {
   routingType: "POLICY" | "DIRECT";
   /** The Slack user whose click caused this transition. */
   decidingApproverSlackId: string;
+  /**
+   * M7: the comment/reason belonging to the decision that caused this final
+   * transition — the REJECTED row for a rejection, or the most recent
+   * APPROVED row for an approval (the one that just crossed the required
+   * threshold, which for DIRECT is also the only one). Null renders no
+   * comment section at all — never an empty placeholder.
+   */
+  comment: string | null;
 }
 
 /** DM sent to the original requester once their request reaches a final decision. Never sent for intermediate policy approvals. */
@@ -46,6 +54,7 @@ export function buildRequesterDecisionNotification({
   durationLabel,
   routingType,
   decidingApproverSlackId,
+  comment,
 }: BuildRequesterDecisionNotificationParams): RequesterDecisionMessageContent {
   const approved = decision === "APPROVED";
   const headline = approved ? "✅ Your request was approved" : "❌ Your request was rejected";
@@ -71,11 +80,18 @@ export function buildRequesterDecisionNotification({
     });
   }
 
-  return {
-    text: headline,
-    blocks: [
-      { type: "section", text: { type: "mrkdwn", text: `*${headline}*` } },
-      { type: "section", fields },
-    ],
-  };
+  const blocks: unknown[] = [
+    { type: "section", text: { type: "mrkdwn", text: `*${headline}*` } },
+    { type: "section", fields },
+  ];
+
+  // A POLICY approval's comment isn't attributed to the deciding approver
+  // (see showDecidingApprover above) — labeled generically so it can't be
+  // read as "the final clicker was solely responsible for approval".
+  if (comment) {
+    const label = !approved ? "Reason" : showDecidingApprover ? "Comment" : "Final approval comment";
+    blocks.push({ type: "section", text: { type: "mrkdwn", text: `*${label}:*\n${comment}` } });
+  }
+
+  return { text: headline, blocks };
 }

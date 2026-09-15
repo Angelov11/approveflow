@@ -8,9 +8,27 @@ audit trail. Later milestones may integrate with AWS, GitHub, Supabase
 auth providers, and Google Workspace to automatically grant/revoke
 temporary access.
 
-## Current milestone: M6 — Slack App Home
+## Current milestone: M7 — Decision Comments & Rejection Reasons
 
-M6 adds a persistent **App Home** tab and makes it the **primary navigation
+M7 gives Approve/Reject decisions context. Clicking **Approve** now opens a
+small modal with an optional **Comment** field; clicking **Reject** opens
+one with a **required Reason** field (blank/whitespace-only is rejected
+with a Slack-native validation error, never silently accepted). Submitting
+either modal re-authorizes and records the decision atomically through the
+same `decide_on_request()` RPC as every prior milestone — opening the modal
+itself grants no authorization at all. The comment/reason is persisted
+immutably on the `approvals` row, shown in Request Details next to the
+relevant decision, and included in the requester's final-decision
+notification. No new authorization model, no new database migration
+concept beyond two additive constraints on the already-existing
+`approvals.comment` column, no new Slack scope. See [M7: Decision Comments
+architecture](#m7-decision-comments-architecture) below. **Not yet
+deployed** — pending migration review (see [Production data inspection
+before migrating](#m7-production-data-inspection-before-migrating)).
+
+## Previously: M6 — Slack App Home
+
+M6 added a persistent **App Home** tab and made it the **primary navigation
 surface** for ApproveFlow. Opening the Home tab shows a short intro, a
 single top-level **Create Request** button, a "My Requests" summary (your 3
 most recent, plus a **View all requests** button that appears once there
@@ -232,6 +250,13 @@ was done. The Events API subscription for `app_home_opened` is a Slack app
 an OAuth scope, so it requires no reinstall — existing installations start
 getting `app_home_opened` events as soon as the event is enabled on the app
 and the Request URL is verified.
+
+**M7 adds no new scope either.** `views.open`/`views.push`/`views.update` —
+the only Slack Web API calls the decision-comment modal flow uses — are all
+already covered by the `chat:write`/Interactivity-enabled posture from
+M3/M5; opening one more modal type requires nothing new. `SLACK_BOT_SCOPES`
+in `src/lib/slack/install-provider.ts` remains exactly
+`["commands", "chat:write"]`, unchanged since M1/M3.
 
 ## Slack request verification
 
@@ -534,7 +559,11 @@ test runner. It is a specification the SQL function is written to match,
 reviewed for consistency, not a transactional guarantee in its own right;
 re-implementing the count/update in JS would reintroduce the exact race the
 DB-level lock exists to prevent. Keep both in sync if the algorithm ever
-changes.
+changes. **M7's comment/reason validation is deliberately NOT added to this
+mirror** — it's an input-normalization rule, not an authorization/threshold
+rule, so it doesn't change which of the existing 17 cases apply; see [M7:
+Decision Comments architecture](#m7-decision-comments-architecture) for
+where comment validation actually lives and how it's verified instead.
 
 ## Build
 
@@ -1162,6 +1191,248 @@ On an account with **more than 3** requests submitted: open Home.
    server logs after an uninstall) → the endpoint must ack 200 without
    error, never a 500.
 
+## M7: Decision Comments architecture
+
+### What changed, and what deliberately didn't
+
+Approve/Reject no longer commits a decision on click. The click now opens a
+small modal (optional Comment for Approve, required Reason for Reject);
+submitting *that* modal is what actually calls `decide_on_request()`. This
+is the only behavioral change — the RPC's authorization branches (DIRECT
+exact-approver-id, POLICY live-membership), the row lock, duplicate-decision
+prevention, immediate-rejection semantics, and threshold-approval semantics
+are all copied verbatim from the M4 migration into the M7 one. Nothing about
+*who* can decide, or *when* a decision finalizes a request, changed.
+
+### `approvals.comment` already existed — this just enforces and surfaces it
+
+`approvals.comment` has existed since the M3 schema, and `decide_on_request`
+has accepted a `p_comment` parameter and inserted it since the M4 routing
+update — no caller ever passed one, so every existing row has `comment =
+NULL`. M7 doesn't add a column; it adds validation (in the RPC) and two
+CHECK constraints (in the schema), then finally gives the UI a way to
+populate it.
+
+### Schema migration: `20260915212000_add_approval_comment_constraints.sql`
+
+Two constraints on `approvals`:
+
+- `approvals_comment_max_length` — `comment IS NULL OR length(comment) <=
+  1000`. Added as a normal (immediately validated) constraint — safe,
+  because every existing row has `comment = NULL`.
+- `approvals_rejected_requires_comment` — `decision <> 'REJECTED' OR
+  (comment IS NOT NULL AND length(trim(comment)) > 0)`. Added `NOT VALID`.
+
+#### M7: Production data inspection before migrating
+
+Before writing the migration, production `approvals` was inspected
+read-only via the service-role client: **12 rows total — 8 APPROVED, 4
+REJECTED, and all 4 REJECTED rows have `comment = NULL`** (zero rows of any
+decision have ever had a non-null comment, so the max-length constraint has
+nothing to violate either). A standard (validated) `CHECK` for
+"REJECTED requires a comment" would immediately fail against those 4
+historical rows.
+
+`NOT VALID` is Postgres's built-in answer to exactly this situation: the
+constraint is enforced for every INSERT/UPDATE from the moment the migration
+runs, but the initial validation scan over existing rows is skipped, so the
+4 historical NULL-comment rejections are grandfathered in rather than
+fabricated a reason or deleted. This migration deliberately never runs
+`VALIDATE CONSTRAINT` afterward — doing so would fail for the same reason.
+`approvals` has no `UPDATE` path at all (immutable by design since M3), so
+those 4 rows will never be touched again regardless.
+
+### RPC migration: `20260915212100_update_decide_on_request_for_comment_validation.sql`
+
+`decide_on_request(p_request_id, p_approver_id, p_decision, p_comment)` — the
+signature is unchanged (`p_comment` has existed since M4). What's new is
+three lines inserted right after the existing `p_decision` sanity check,
+before the row lock:
+
+```sql
+v_comment := nullif(trim(both from p_comment), '');
+
+if v_comment is not null and length(v_comment) > 1000 then
+  raise exception 'comment exceeds maximum length of 1000 characters';
+end if;
+
+if p_decision = 'REJECTED' and v_comment is null then
+  raise exception 'REJECTED decision requires a non-blank comment';
+end if;
+```
+
+Both `raise exception` paths are defensive backstops for a
+should-never-happen case — the same posture as the pre-existing
+`p_decision not in ('APPROVED','REJECTED')` check just above them. The
+application layer (`validate-decision-submission.ts`) validates first and
+gives good Slack-native UX; the RPC is what makes that validation
+*authoritative* rather than advisory, exactly like every other rule this
+function already enforces.
+
+### 1000-character limit, enforced in three places, none of them truncate
+
+- Slack modal: `max_length: 1000` on the `plain_text_input` element
+  (`build-decision-modal.ts`) — Slack's own client refuses to accept more.
+- Application validation: `validate-decision-submission.ts` returns a
+  `response_action: errors` validation error above the same limit.
+- Database/RPC: `raise exception` above the same limit (backstop).
+
+None of the three silently truncates — an oversized value is always
+rejected, never cut short.
+
+### Approve/Reject buttons now open modals, not immediate decisions
+
+`src/lib/requests/build-decision-modal.ts` builds the two modals
+(`approveflow_approve_decision` / `approveflow_reject_decision` callback
+IDs — two distinct callback IDs, not one shared one with a "decision" field
+in `private_metadata`, specifically so *which* decision this is comes from
+Slack's own trusted `view.callback_id`, never from a value this app would
+otherwise have to trust out of `private_metadata`). `private_metadata`
+carries only `{ requestId, source }` — `requestId` is an opaque locator
+(re-validated by `decide_on_request` regardless of what's passed), and
+`source` says only where to reflect the outcome afterward:
+`{ type: "message", channelId, messageTs }` or `{ type: "modal", viewId }`.
+It deliberately does **not** carry the original message/view `blocks` —
+doing so risked overflowing Slack's 3000-character `private_metadata` limit
+for a request with a long resource/reason, since that content would have to
+survive a full round trip through the Slack client. Instead, the
+message-origin reflect step rebuilds the DM content fresh from the (immutable)
+request row via the existing `buildApprovalNotification` +
+`replaceActionsWithStatus` — deterministic, and reusing exactly the same two
+functions the pre-M7 flow already used, just called with fresh data instead
+of payload-echoed blocks.
+
+`views.open` vs. `views.push` for the decision modal follows the same rule
+M6 established for Home vs. modal origin: a message-origin click has no
+modal stack to append to (`views.open`); a click from inside the M5 Request
+Details modal stacks the decision modal on top of it (`views.push`) — so its
+Cancel button naturally returns to Request Details, already updated once
+the decision modal closes.
+
+### Final submission re-authorizes independently — opening the modal proves nothing
+
+`handleDecisionSubmission` in `src/app/api/slack/interactions/route.ts` is
+the only place a decision is actually recorded. It:
+
+1. Validates the Slack signature (already done before any payload is parsed).
+2. Re-resolves `slackTeamId`/`slackUserId` from the signed
+   `payload.team`/`payload.user` envelope — never from `private_metadata`.
+3. Reads `requestId`/`source` out of `private_metadata` as opaque locators only.
+4. Upserts the acting Slack user, then calls `decideOnRequest()` — which
+   re-runs the *entire* DIRECT/POLICY authorization check from scratch.
+
+Nothing about having successfully opened the modal is trusted at this step.
+This matters most for POLICY routing, where membership is live: if someone
+is removed from a policy between opening the Approve modal and submitting
+it, `decide_on_request` returns `unauthorized` at submission time exactly as
+if they'd never opened it — the same guarantee already verified for M5/M6's
+modal-origin decisions, now exercised across a two-step (open, then submit)
+interaction instead of one.
+
+### Validation UX vs. RPC authority
+
+- **Reject with a blank/whitespace reason**: `validate-decision-submission.ts`
+  returns `response_action: errors` attached to the Reason block — modal
+  stays open, nothing is written.
+- **Oversized comment/reason**: same — a validation error, never truncated.
+- **A decision that passed structural validation but the RPC couldn't apply**
+  (`not_found`, `already_final`, `unauthorized`, `already_decided`,
+  `no_policy`) — the modal is replaced in place
+  (`response_action: "update"`) with a small result view built via the
+  existing `buildErrorView` + `describeDecisionOutcome`, so the user
+  understands *why* nothing happened instead of the modal silently closing.
+- **A genuinely recorded decision** (`approved`, `rejected`,
+  `recorded_pending`) — empty-body ack, which closes the decision modal
+  (popping back to Request Details if it was pushed on top of it).
+
+### Request Details and requester notifications
+
+`RequestDecisionRecord` gained a `comment: string | null` field, threaded
+through `getRequestDetails`'s existing `approvals` query (one added column,
+same workspace-scoped query shape). `decisionLine()` in
+`build-requests-views.ts` appends `"<comment>"` under an APPROVED line, or
+`Reason: "<comment>"` under a REJECTED line, only when a comment actually
+exists — a historical decision with `comment = NULL` renders exactly as it
+always has, with no "No comment provided" placeholder.
+
+`buildRequesterDecisionNotification` gained the same `comment` field, with
+the same non-misleading POLICY-approval rule M4 already established for
+*attribution*: a DIRECT decision's comment is labeled "Comment"/"Reason" and
+sits below the existing "Approved/Rejected by" field; a POLICY approval's
+comment is labeled generically **"Final approval comment"** with no
+attribution line at all, so it can never be read as "the last clicker alone
+approved this." `notify-requester.ts` resolves which comment is "the
+relevant one" with one extra query: the (unique) REJECTED row for a
+rejection, or the most recently-decided APPROVED row for an approval — the
+one that just crossed the threshold, which for DIRECT is also the only row
+that will ever exist. The existing `isFinalDecisionTransition` gate is
+unchanged: intermediate POLICY approvals, duplicates, and already-final
+attempts still send zero requester notifications, and a Slack delivery
+failure still can't roll back the already-committed decision.
+
+### Known limitation carried over from M4/M5
+
+Requester notification and outcome-reflection are still best-effort,
+synchronous, no-retry — a process crash between `decide_on_request()`
+committing and the notification call completing loses that one
+notification with no queue/retry, exactly the accepted M4 tradeoff. M7
+doesn't change this posture.
+
+## M7 end-to-end testing procedure (prepared, not yet executed — pending migration review)
+
+Needs: both M7 migrations reviewed and pushed (`pnpm dlx supabase db push`,
+not run by me), and at least one workspace with both a DIRECT-eligible and a
+POLICY-eligible request type.
+
+### Test A — DIRECT approve with comment
+
+1. As requester, create a Custom Request, selecting another user as approver.
+2. As that approver, open it from Waiting for Me (or the DM) → **Approve** →
+   enter "Approved for M7 E2E" → submit.
+3. Verify: request `APPROVED`; the `approvals` row's `comment` = "Approved
+   for M7 E2E"; Request Details shows the comment under the approval;
+   requester's DM includes a Comment section with that text; the request no
+   longer appears in that approver's Waiting for Me.
+
+### Test B — DIRECT approve without a comment
+
+Repeat Test A leaving Comment blank. Verify: succeeds; `comment` is `NULL`
+in the DB; Request Details and the requester DM show no empty Comment
+section anywhere (no placeholder text).
+
+### Test C — DIRECT reject requires a reason
+
+1. Click **Reject**, try submitting with the Reason field blank, then
+   whitespace-only.
+2. Verify each attempt: modal stays open, a validation error appears under
+   Reason, no `approvals` row is created (`decide_on_request` never even ran).
+3. Enter "Rejected for M7 E2E" → submit.
+4. Verify: request `REJECTED`; reason persisted; Request Details shows
+   `Reason: "Rejected for M7 E2E"`; requester's DM shows a Reason section
+   with that text.
+
+### Test D — POLICY approval
+
+1. Create a Production Access request (policy-routed), selecting a
+   non-policy-member as the manual modal approver.
+2. Verify routing still overrides the manual selection (`direct_approver_id`
+   stays `NULL`, `approval_policy_id` is set) — unchanged M4/M5 behavior.
+3. As the actual configured policy member, Approve with an optional comment.
+4. Verify: Request Details shows the policy name and the approval comment
+   against the correct approver; the requester's final notification (once
+   the required-approvals threshold is met) shows "Final approval comment"
+   without claiming that approver alone was responsible.
+
+### Test E — security/stale authorization
+
+If practical without disrupting the current production policy
+configuration: open the Approve modal as a policy member, then (in a
+separate, explicitly-approved step) remove that membership, then submit the
+already-open modal. Verify `decide_on_request` returns `unauthorized` and no
+approval row is created. **Do not alter production policy membership for
+this test without separate explicit approval** — this is the one scenario
+in the plan that touches shared configuration state, not just request data.
+
 ## Project structure
 
 ```
@@ -1205,13 +1476,17 @@ src/
       validate-request-submission.ts  # pure: view_submission validation (unit tested)
       validate-request-submission.test.ts
       build-approval-notification.ts  # pure: approver DM builder, message update, outcome text
-      parse-block-action.ts       # pure: block_actions (Approve/Reject) validation — message- and modal-origin (unit tested)
+      parse-block-action.ts       # pure: block_actions (Approve/Reject) validation — message- and modal-origin (unit tested; M7: now also requires trigger_id)
       parse-block-action.test.ts
+      build-decision-modal.ts     # pure (M7): Approve/Reject decision modal builder — optional Comment / required Reason (unit tested)
+      build-decision-modal.test.ts
+      validate-decision-submission.ts  # pure (M7): decision modal view_submission validation — comment/reason rules (unit tested)
+      validate-decision-submission.test.ts
       compute-decision-outcome.ts # pure mirror of decide_on_request()'s algorithm (unit tested; both routing models)
       compute-decision-outcome.test.ts
-      build-requester-decision-notification.ts  # pure: final-decision requester DM + notification gating
+      build-requester-decision-notification.ts  # pure: final-decision requester DM + notification gating (M7: + comment/reason rendering)
       build-requester-decision-notification.test.ts
-      approval-actions.ts         # server-only: decide_on_request() RPC wrapper
+      approval-actions.ts         # server-only: decide_on_request() RPC wrapper (M7: + comment param)
       approval-policies.ts        # server-only: active-policy lookup + policy recipient list
       notify-approvers.ts         # server-only: sends DMs to a precomputed recipient list
       notify-requester.ts         # server-only: sends the final-decision DM to the requester
@@ -1223,7 +1498,7 @@ src/
       build-requests-views.test.ts
       build-app-home-view.ts      # pure (M6): App Home Block Kit view builder, reuses build-requests-views' row builder (unit tested)
       build-app-home-view.test.ts
-      request-views.ts            # server-only (M5, extended M6): listRequestsByRequester (now takes an optional limit), listRequestsWaitingForApprover, getRequestDetails
+      request-views.ts            # server-only (M5, extended M6/M7): listRequestsByRequester (optional limit), listRequestsWaitingForApprover, getRequestDetails (M7: + approval comment)
     supabase/
       admin.ts                    # server-only: service-role Supabase client
   types/
@@ -1248,4 +1523,6 @@ supabase/
     *_enforce_direct_approval_threshold.sql
     # M5 adds no migration — the existing schema already had everything needed.
     # M6 adds no migration either — Home is a read-mostly front door over the existing schema.
+    *_add_approval_comment_constraints.sql          # M7 — NOT YET PUSHED, pending review
+    *_update_decide_on_request_for_comment_validation.sql  # M7 — NOT YET PUSHED, pending review
 ```
