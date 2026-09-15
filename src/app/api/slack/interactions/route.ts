@@ -5,8 +5,10 @@ import { serverEnv } from "@/lib/env.server";
 import { decideOnRequest } from "@/lib/requests/approval-actions";
 import { findActivePolicyForRequestType, listPolicyRecipients } from "@/lib/requests/approval-policies";
 import { describeDecisionOutcome, replaceActionsWithStatus } from "@/lib/requests/build-approval-notification";
+import { isFinalDecisionTransition } from "@/lib/requests/build-requester-decision-notification";
 import { REQUEST_MODAL_CALLBACK_ID } from "@/lib/requests/build-request-modal";
 import { notifyApprovers, type NotificationRecipient } from "@/lib/requests/notify-approvers";
+import { notifyRequesterOfDecision } from "@/lib/requests/notify-requester";
 import { parseApprovalBlockAction, type BlockActionsPayload } from "@/lib/requests/parse-block-action";
 import { listActiveRequestTypes } from "@/lib/requests/request-types";
 import { validateRequestSubmission, type ViewSubmissionPayload } from "@/lib/requests/validate-request-submission";
@@ -217,6 +219,27 @@ async function handleApprovalAction(payload: BlockActionsPayload): Promise<Respo
     );
   } catch (error) {
     console.error("Failed to update Slack message after decision:", error instanceof Error ? error.message : "unknown error");
+  }
+
+  // Notify the original requester, but ONLY when THIS interaction actually
+  // caused a final transition — never for retries/duplicates/already-final
+  // requests/unauthorized attempts/intermediate policy approvals. Gating on
+  // the RPC's own outcome (rather than e.g. re-checking request status)
+  // means a Slack HTTP retry of the same click — which decide_on_request
+  // reports as "already_decided" — can never trigger a second notification.
+  // Best-effort and independent of the message-update above: either can
+  // fail without affecting the other or the already-committed decision.
+  if (isFinalDecisionTransition(result.outcome)) {
+    try {
+      await notifyRequesterOfDecision({
+        workspace,
+        requestId,
+        decision: result.outcome === "approved" ? "APPROVED" : "REJECTED",
+        decidingApproverSlackId: slackUserId,
+      });
+    } catch (error) {
+      console.error("Failed to notify requester of decision:", error instanceof Error ? error.message : "unknown error");
+    }
   }
 
   return ack();
