@@ -4,12 +4,15 @@ import type { NextRequest } from "next/server";
 import { serverEnv } from "@/lib/env.server";
 import { decideOnRequest } from "@/lib/requests/approval-actions";
 import { findActivePolicyForRequestType, listPolicyRecipients } from "@/lib/requests/approval-policies";
-import { describeDecisionOutcome, replaceActionsWithStatus } from "@/lib/requests/build-approval-notification";
-import { isFinalDecisionTransition } from "@/lib/requests/build-requester-decision-notification";
+import { describeDecisionOutcome, replaceActionsWithStatus, APPROVE_ACTION_ID, REJECT_ACTION_ID } from "@/lib/requests/build-approval-notification";
 import { REQUEST_MODAL_CALLBACK_ID } from "@/lib/requests/build-request-modal";
+import { buildErrorView, buildRequestDetailsView, buildWaitingListView } from "@/lib/requests/build-requests-views";
+import { isFinalDecisionTransition } from "@/lib/requests/build-requester-decision-notification";
 import { notifyApprovers, type NotificationRecipient } from "@/lib/requests/notify-approvers";
 import { notifyRequesterOfDecision } from "@/lib/requests/notify-requester";
 import { parseApprovalBlockAction, type BlockActionsPayload } from "@/lib/requests/parse-block-action";
+import { parseRequestsNavigationAction, VIEW_REQUEST_ACTION_ID, VIEW_WAITING_REQUESTS_ACTION_ID, type RequestsNavigationPayload } from "@/lib/requests/parse-requests-action";
+import { getRequestDetails, listRequestsWaitingForApprover } from "@/lib/requests/request-views";
 import { listActiveRequestTypes } from "@/lib/requests/request-types";
 import { validateRequestSubmission, type ViewSubmissionPayload } from "@/lib/requests/validate-request-submission";
 import { findWorkspaceBySlackTeamId, upsertSlackUser } from "@/lib/requests/workspace-lookup";
@@ -44,7 +47,7 @@ export async function POST(request: NextRequest) {
     return ack();
   }
 
-  let payload: { type?: string };
+  let payload: { type?: string; actions?: { action_id?: string }[] };
   try {
     payload = JSON.parse(rawPayload);
   } catch {
@@ -52,7 +55,15 @@ export async function POST(request: NextRequest) {
   }
 
   if (payload.type === "block_actions") {
-    return handleApprovalAction(payload as BlockActionsPayload);
+    const actionId = payload.actions?.[0]?.action_id;
+    if (actionId === APPROVE_ACTION_ID || actionId === REJECT_ACTION_ID) {
+      return handleApprovalAction(payload as BlockActionsPayload);
+    }
+    if (actionId === VIEW_REQUEST_ACTION_ID || actionId === VIEW_WAITING_REQUESTS_ACTION_ID) {
+      return handleRequestsNavigation(payload as RequestsNavigationPayload);
+    }
+    // Not one of our recognized actions — ignore safely.
+    return ack();
   }
 
   return handleRequestSubmission(payload as ViewSubmissionPayload);
@@ -180,7 +191,7 @@ async function handleApprovalAction(payload: BlockActionsPayload): Promise<Respo
     // Not one of our recognized actions, or malformed — ignore safely.
     return ack();
   }
-  const { slackTeamId, slackUserId, actionId, requestId, channelId, messageTs, messageBlocks } = parsed.data;
+  const { slackTeamId, slackUserId, actionId, requestId, source } = parsed.data;
 
   const workspace = await findWorkspaceBySlackTeamId(slackTeamId);
   if (!workspace) {
@@ -198,9 +209,11 @@ async function handleApprovalAction(payload: BlockActionsPayload): Promise<Respo
     return ack();
   }
 
-  // Best-effort: update the clicking approver's own message so their button
-  // can't be reused as though still pending. A failure here doesn't affect
-  // the decision already committed above.
+  // Best-effort: reflect the outcome where the click came from. A failure
+  // here doesn't affect the decision already committed above. The button
+  // could live in a posted DM (M3/M4) or in the M5 Request Details modal —
+  // decide_on_request()/the decision itself is identical either way; only
+  // how we show the result differs.
   try {
     const botToken = decryptBotToken({
       ciphertext: workspace.bot_access_token_ciphertext,
@@ -209,16 +222,23 @@ async function handleApprovalAction(payload: BlockActionsPayload): Promise<Respo
     });
     const client = new WebClient(botToken);
     const statusText = describeDecisionOutcome(result);
-    await client.chat.update(
-      {
-        channel: channelId,
-        ts: messageTs,
-        text: statusText,
-        blocks: replaceActionsWithStatus(messageBlocks, statusText),
-      } as Parameters<typeof client.chat.update>[0],
-    );
+
+    if (source.type === "message") {
+      await client.chat.update(
+        {
+          channel: source.channelId,
+          ts: source.messageTs,
+          text: statusText,
+          blocks: replaceActionsWithStatus(source.messageBlocks, statusText),
+        } as Parameters<typeof client.chat.update>[0],
+      );
+    } else {
+      const details = await getRequestDetails(workspace.id, requestId, approver.id);
+      const view = details ? buildRequestDetailsView({ details, banner: statusText }) : buildErrorView("This request could not be found.");
+      await client.views.update({ view_id: source.viewId, view } as Parameters<typeof client.views.update>[0]);
+    }
   } catch (error) {
-    console.error("Failed to update Slack message after decision:", error instanceof Error ? error.message : "unknown error");
+    console.error("Failed to reflect decision outcome in Slack:", error instanceof Error ? error.message : "unknown error");
   }
 
   // Notify the original requester, but ONLY when THIS interaction actually
@@ -227,8 +247,6 @@ async function handleApprovalAction(payload: BlockActionsPayload): Promise<Respo
   // the RPC's own outcome (rather than e.g. re-checking request status)
   // means a Slack HTTP retry of the same click — which decide_on_request
   // reports as "already_decided" — can never trigger a second notification.
-  // Best-effort and independent of the message-update above: either can
-  // fail without affecting the other or the already-committed decision.
   if (isFinalDecisionTransition(result.outcome)) {
     try {
       await notifyRequesterOfDecision({
@@ -240,6 +258,47 @@ async function handleApprovalAction(payload: BlockActionsPayload): Promise<Respo
     } catch (error) {
       console.error("Failed to notify requester of decision:", error instanceof Error ? error.message : "unknown error");
     }
+  }
+
+  return ack();
+}
+
+/** Navigation within the /requests modal flow: opening a request's details, or pushing the full "Waiting for Me" list. Never an authorization decision — just reads. */
+async function handleRequestsNavigation(payload: RequestsNavigationPayload): Promise<Response> {
+  const parsed = parseRequestsNavigationAction(payload);
+  if (!parsed.ok) {
+    return ack();
+  }
+  const { slackTeamId, slackUserId, triggerId } = parsed.data;
+
+  const workspace = await findWorkspaceBySlackTeamId(slackTeamId);
+  if (!workspace) {
+    return ack();
+  }
+
+  try {
+    const viewer = await upsertSlackUser(workspace.id, slackUserId);
+
+    let view;
+    if (parsed.data.actionId === VIEW_WAITING_REQUESTS_ACTION_ID) {
+      const waitingRequests = await listRequestsWaitingForApprover(workspace.id, viewer.id);
+      view = buildWaitingListView({ waitingRequests });
+    } else {
+      // Revalidates workspace ownership again inside getRequestDetails —
+      // the request id from the button value is an opaque locator only.
+      const details = await getRequestDetails(workspace.id, parsed.data.requestId, viewer.id);
+      view = details ? buildRequestDetailsView({ details }) : buildErrorView("This request could not be found.");
+    }
+
+    const botToken = decryptBotToken({
+      ciphertext: workspace.bot_access_token_ciphertext,
+      iv: workspace.bot_access_token_iv,
+      authTag: workspace.bot_access_token_auth_tag,
+    });
+    const client = new WebClient(botToken);
+    await client.views.push({ trigger_id: triggerId, view } as Parameters<typeof client.views.push>[0]);
+  } catch (error) {
+    console.error("Failed to push /requests navigation view:", error instanceof Error ? error.message : "unknown error");
   }
 
   return ack();

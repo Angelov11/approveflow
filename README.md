@@ -8,7 +8,17 @@ audit trail. Later milestones may integrate with AWS, GitHub, Supabase
 auth providers, and Google Workspace to automatically grant/revoke
 temporary access.
 
-## Current milestone: M4 — Zero-Configuration Direct Approver Selection
+## Current milestone: M5 — Slack Request History & Request Details
+
+M5 adds `/requests`: a way to see your ApproveFlow activity without leaving
+Slack. Running it opens a modal with two sections — **My Requests** (what
+you've submitted) and **Waiting for Me** (pending requests you're currently
+authorized to decide). Opening any request shows its full details, and if
+you're authorized, Approve/Reject right from there — using the exact same
+`decide_on_request` atomic decision path as the DM-based buttons from M3/M4.
+No web dashboard, no login, no new Slack scopes.
+
+## Previously: M4 — Zero-Configuration Direct Approver Selection
 
 M0 set up the application skeleton. M1 added Slack OAuth installation with
 encrypted bot-token storage. M2 added `/request`: a workspace member submits
@@ -222,12 +232,20 @@ I have not modified your Slack app configuration myself.
    - Command: `/request`
    - Request URL: `<APP_URL>/api/slack/commands/request`
    - Short description: whatever you'd like (e.g. "Submit an access/approval request")
-2. **Features → Interactivity & Shortcuts**:
+2. **Features → Slash Commands** → **Create New Command** (M5):
+   - Command: `/requests`
+   - Request URL: `<APP_URL>/api/slack/commands/requests`
+   - Short description: e.g. "View your ApproveFlow requests"
+3. **Features → Interactivity & Shortcuts**:
    - Turn Interactivity **On**
-   - Request URL: `<APP_URL>/api/slack/interactions`
-3. Bot Token Scopes (**OAuth & Permissions**) should already include
-   `commands` from M1 — no new scope is needed for M2.
-4. If you changed the Slash Command or Interactivity URL after already
+   - Request URL: `<APP_URL>/api/slack/interactions` (same URL handles `/request` submissions, `/requests` navigation, and Approve/Reject — see [M5: /requests architecture](#m5-requests-architecture))
+4. Bot Token Scopes (**OAuth & Permissions**) should already include
+   `commands` and `chat:write` from M1/M3 — **no new scope is needed for M5**.
+   Verified directly: `views.push`'s own reference documentation states
+   "Scopes: No scopes required", and `views.open`/`views.update` are in the
+   same family — modal operations are gated by the app having Interactivity
+   enabled (step 3), not by an OAuth scope.
+5. If you changed a Slash Command or the Interactivity URL after already
    installing the app, **reinstall the app to the workspace** so Slack picks
    up the change (existing installations/tokens are unaffected — this repo's
    OAuth callback upserts by `slack_team_id`, so reinstalling updates the
@@ -367,8 +385,9 @@ Runs with Node's built-in test runner (`node --experimental-strip-types
   malformed private_metadata, missing/malformed approver selection,
   multiple simultaneous errors.
 - `src/lib/requests/parse-block-action.test.ts` — valid Approve/Reject
-  actions recognized, unknown action ignored, missing identifiers/malformed
-  value rejected safely.
+  actions recognized from both a posted-message origin and a modal origin
+  (M5), unknown action ignored, missing identifiers/malformed value
+  rejected safely.
 - `src/lib/requests/compute-decision-outcome.test.ts` — the approval
   state-machine for **both routing models**: policy-based (authorized
   approval, unauthorized approver, below-threshold stays PENDING, threshold
@@ -379,11 +398,32 @@ Runs with Node's built-in test runner (`node --experimental-strip-types
   decisions after finalization are ignored), plus explicit routing-stability
   cases. See [Atomic approval design](#atomic-approval-design) for why this
   is a *pure mirror* of the real enforcement, not the enforcement itself.
+- `src/lib/requests/build-requester-decision-notification.test.ts` — final-
+  transition gating and attribution rules for the requester notification.
+- `src/lib/slack/format-date.test.ts` — Slack date-token construction.
+- `src/lib/requests/status-display.test.ts` — every status renders with
+  both an emoji and a text label.
+- `src/lib/requests/parse-requests-action.test.ts` (M5) — `view_request`/
+  `view_waiting_requests` recognized, missing request id/trigger id/team/user
+  rejected safely, unknown action ignored.
+- `src/lib/requests/build-requests-views.test.ts` (M5) — My Requests and
+  Waiting-for-Me empty states, the "showing N most recent" notice appears
+  only when there's actually more, each row includes all 5 required fields,
+  DIRECT pending vs. decided rendering, POLICY rendering with historical
+  decisions *and* current pending members shown as distinct things, a
+  decision from someone since removed from the policy still renders,
+  historical null-policy routing renders the safe fallback message (never a
+  fabricated approver), Approve/Reject only render when authorized, and
+  nothing renders internal UUIDs/`routing_type` values/column names.
 
-These are unit tests only. Real Slack traffic (an actual `/request` invocation
-and modal submission from Slack's servers) has not been tested — that
-requires the Request URLs above to be configured against a publicly
-reachable endpoint. See the verification notes in the M1/M2/M3/M4 completion reports.
+These are unit tests only — the pure Block Kit builders and payload
+parsers, per this codebase's established approach (DB-touching server-only
+modules like `request-views.ts` are verified by direct code review and live
+testing against real data instead, same as every prior milestone's
+server-only wrappers). Real Slack traffic has not been tested for M5 — that
+requires the two Slash Command URLs and the Interactivity URL to be
+configured against a publicly reachable endpoint. See the verification
+notes in the M1–M5 completion reports.
 
 ## Atomic approval design
 
@@ -633,6 +673,115 @@ client-side regardless, so the fallback looks correct without needing any
 additional scope. See `formatUserMention()` in
 `src/lib/requests/build-approval-notification.ts`.
 
+## M5: /requests architecture
+
+### Navigation UX
+
+Slack modals don't have native tabs, so rather than build a custom
+tab-switching framework, `/requests` opens **one modal** ("Request Center")
+with both sections stacked:
+
+- **My Requests** is shown inline (up to 10, newest first) since it's
+  purely informational.
+- **Waiting for Me** is shown as a summary line + a button
+  ("`N` requests need your decision" → **View waiting requests**), since
+  those entries need Approve/Reject affordances that would clutter the main
+  view. Clicking it `views.push`es a dedicated "Waiting for Me" list.
+
+Opening any request (from either list) `views.push`es a "Request Details"
+view. Slack automatically shows a back-arrow in the modal header once
+you've pushed a view — no custom "Back" button needed. Every pushed view's
+**Close** button closes the whole stack, which is the simplest correct
+behavior for M5 (no partial-stack-close requirement exists).
+
+```
+/requests
+  → Request Center (My Requests inline + Waiting-for-me summary)
+      → [View] on a My-Requests row       → Request Details (read-only unless also authorized)
+      → [View waiting requests]           → Waiting for Me list
+          → [View] on a waiting row       → Request Details (with Approve/Reject)
+```
+
+### Reusing the M3/M4 decision path — not a second implementation
+
+Approve/Reject buttons inside the Request Details modal use the **exact
+same** `approve_request`/`reject_request` action IDs and the exact same
+`decide_on_request()` call (`src/lib/requests/approval-actions.ts`,
+unchanged) as the DM-based buttons from M3/M4. The only thing that differs
+by origin is how the outcome is *reflected*: a DM message gets
+`chat.update`d (unchanged M3/M4 behavior); a modal gets `views.update`d
+with a freshly-rebuilt Request Details view. `src/lib/requests/parse-block-
+action.ts` was extended (not duplicated) to recognize both origins — Slack
+sends `channel`/`message` for a posted-message click and `view` instead for
+a modal click, so the parser returns a `source: {type: "message", ...} |
+{type: "modal", ...}` discriminator that the interactions route branches
+on only for the reflection step, never for authorization.
+
+### Stale-modal handling
+
+Because the reflection step always re-runs `decide_on_request()` first and
+then re-fetches fresh request details before rebuilding the view, every
+scenario in the M5 spec resolves correctly without any client-side
+correctness assumption:
+
+- **Someone else finalizes it first, then you click Approve**: the RPC
+  returns `already_final`; the modal updates to show the real current
+  status via a banner, no second decision is recorded.
+- **You're removed from the policy, then you click Approve**: the RPC
+  returns `unauthorized`; the modal shows "You're not authorized to decide
+  on this request." — the click never touches the database.
+
+Database state is authoritative in both cases — the UI only ever *reports*
+what the RPC decided, never assumes it.
+
+### Database query design
+
+Three focused, workspace-scoped queries in `src/lib/requests/request-views.ts`:
+
+- **`listRequestsByRequester(workspaceId, requesterId)`** — always filters
+  by both `workspace_id` and `requester_id` together (never one alone),
+  newest-first, capped at 10 with an exact `count` fetched in the same
+  query so the "showing your 10 most recent" notice only appears when
+  there's actually more.
+- **`listRequestsWaitingForApprover(workspaceId, userId)`** — the
+  security-sensitive one. Computed with a small, fixed number of targeted
+  queries (not fetched-then-filtered-in-JS): DIRECT candidates
+  (`direct_approver_id = userId`), then the user's policy memberships, then
+  PENDING POLICY requests for those policy IDs, then that user's own
+  `approvals` for exactly those candidate IDs — filtered out in one pass.
+  A policy member who has already decided is correctly excluded (matches
+  `decide_on_request`'s own `already_decided` rule, read-side); a
+  historical request with a null `approval_policy_id` can never match any
+  real policy ID, so it's excluded by construction, no special-case needed.
+- **`getRequestDetails(workspaceId, requestId, viewerUserId)`** — requires
+  `request.workspace_id = workspaceId` **and** `request.id = requestId`
+  together; returns `null` (not an error) for a request that doesn't exist
+  *or* belongs to a different workspace, so a caller can never distinguish
+  "wrong workspace" from "doesn't exist" by probing UUIDs.
+
+### Decision history vs. current authorization
+
+Per the M4 design, policy *membership* is intentionally live — so
+`getRequestDetails` renders these as two different things: every row ever
+written to `approvals` is shown (a decision from someone since removed
+from the policy is never erased), while "who's still pending" is computed
+fresh from *current* `approval_policy_members` minus whoever's already
+decided. Removing someone from a policy immediately stops them appearing
+as "pending" on requests they hadn't yet decided, without touching the
+historical record of decisions they already made.
+
+### Human-readable output, not database language
+
+Request Details never shows a UUID, `routing_type` value, or column name —
+`src/lib/requests/build-requests-views.ts`'s `RequestRoutingView` type
+speaks only in "Approver: `<@id>`" / "Approval policy: `<name>`" /
+"Approval routing unavailable for this historical request." (the M4
+null-`approval_policy_id` case — never a fabricated policy/approver).
+Request type names come from `request_types.name` (already the
+authoritative display label from M2 — no hardcoded key→label map).
+Timestamps use Slack's `<!date^...>` token so each viewer sees their own
+timezone, with a plain-text fallback.
+
 ## M4 end-to-end testing procedure
 
 Both tests need: migrations pushed (`pnpm dlx supabase db push`, not run by
@@ -680,6 +829,44 @@ in this workspace (single approver, `required_approvals = 1`).
 7. Have the real policy member approve — should behave exactly as in M3
    (atomic transition to `APPROVED`, single `approvals` row).
 
+## M5 end-to-end testing procedure
+
+Needs: the two new Slash Command/Interactivity URL entries added in
+[M2 Slack configuration](#m2-slack-configuration-slash-command-and-interactivity)
+(the `/requests` command specifically), and at least one existing DIRECT
+and one existing POLICY request in the workspace (from prior M4 testing).
+
+### Test A — My Requests
+
+Run `/requests` from an account that has submitted several requests.
+
+- Recent requests appear, newest first, both DIRECT and POLICY ones, with
+  statuses matching production.
+- Open one DIRECT request → correct resource/reason/duration/status, the
+  selected approver shown, and the recorded decision (or "pending") shown.
+- Open one POLICY request → the policy name shown, historical decision(s) shown.
+
+### Test B — Waiting for Me
+
+1. Create a new DIRECT request assigned to another account.
+2. On that approver's account, run `/requests` → the request should appear
+   in Waiting for Me.
+3. Open it → Approve/Reject should be available.
+4. Approve it → it should disappear from that account's Waiting for Me,
+   the requester should receive the final notification (M4 behavior,
+   unchanged), and it should show `APPROVED` in the requester's My Requests.
+
+### Test C — Policy request
+
+1. Create a Production Access request.
+2. On the configured policy approver's account, run `/requests` → the
+   request should appear in Waiting for Me.
+3. On the account that was manually selected in the modal (but is **not**
+   a policy member), run `/requests` → the request should **not** appear
+   in Waiting for Me.
+4. Have the configured approver decide → normal M4 behavior (requester
+   notified, request removed from Waiting for Me for that approver).
+
 ## Project structure
 
 ```
@@ -690,8 +877,10 @@ src/
       slack/
         install/route.ts           # GET /api/slack/install — starts OAuth
         oauth/callback/route.ts    # GET /api/slack/oauth/callback
-        commands/request/route.ts  # POST /api/slack/commands/request — /request slash command
-        interactions/route.ts      # POST /api/slack/interactions — modal submission
+        commands/
+          request/route.ts         # POST /api/slack/commands/request — /request slash command
+          requests/route.ts        # POST /api/slack/commands/requests — /requests slash command (M5)
+        interactions/route.ts      # POST /api/slack/interactions — modal submissions, Approve/Reject, /requests navigation
     slack/installed/page.tsx       # OAuth result page
     page.tsx                       # home page (Add to Slack button)
     layout.tsx
@@ -708,6 +897,8 @@ src/
       token-encryption.ts         # server-only: encrypt/decrypt bot tokens
       verify-request.ts           # pure: Slack request signature verification (unit tested)
       verify-request.test.ts
+      format-date.ts              # pure (M5): Slack date-token formatting (unit tested)
+      format-date.test.ts
     requests/
       duration-options.ts         # pure: shared duration select options + labels
       request-types.ts            # server-only: default request types + idempotent seeding
@@ -716,13 +907,23 @@ src/
       validate-request-submission.ts  # pure: view_submission validation (unit tested)
       validate-request-submission.test.ts
       build-approval-notification.ts  # pure: approver DM builder, message update, outcome text
-      parse-block-action.ts       # pure: block_actions (Approve/Reject) validation (unit tested)
+      parse-block-action.ts       # pure: block_actions (Approve/Reject) validation — message- and modal-origin (unit tested)
       parse-block-action.test.ts
       compute-decision-outcome.ts # pure mirror of decide_on_request()'s algorithm (unit tested; both routing models)
       compute-decision-outcome.test.ts
+      build-requester-decision-notification.ts  # pure: final-decision requester DM + notification gating
+      build-requester-decision-notification.test.ts
       approval-actions.ts         # server-only: decide_on_request() RPC wrapper
-      approval-policies.ts        # server-only (M4): active-policy lookup + policy recipient list
+      approval-policies.ts        # server-only: active-policy lookup + policy recipient list
       notify-approvers.ts         # server-only: sends DMs to a precomputed recipient list
+      notify-requester.ts         # server-only: sends the final-decision DM to the requester
+      status-display.ts           # pure (M5): status emoji + text label (unit tested)
+      status-display.test.ts
+      parse-requests-action.ts    # pure (M5): /requests navigation click validation (unit tested)
+      parse-requests-action.test.ts
+      build-requests-views.ts     # pure (M5): Request Center / Waiting List / Request Details Block Kit views (unit tested)
+      build-requests-views.test.ts
+      request-views.ts            # server-only (M5): listRequestsByRequester, listRequestsWaitingForApprover, getRequestDetails
     supabase/
       admin.ts                    # server-only: service-role Supabase client
   types/
@@ -744,4 +945,6 @@ supabase/
     *_create_decide_on_request_function.sql
     *_add_direct_approver_routing_to_requests.sql
     *_update_decide_on_request_for_direct_routing.sql
+    *_enforce_direct_approval_threshold.sql
+    # M5 adds no migration — the existing schema already had everything needed.
 ```
