@@ -10,17 +10,20 @@ temporary access.
 
 ## Current milestone: M6 — Slack App Home
 
-M6 adds a persistent **App Home** tab: a front door over the existing
-product, not a second one. Opening the Home tab shows a short intro, a
-**Create Request** button, an **Open Request Center** button, a "My
-Requests" summary (your 3 most recent, since Home is a summary — the full
-list is still `/requests`), and a "Waiting for Me" summary (a count + button,
-or "Nothing is waiting for your approval." when there's nothing to decide).
-Every one of those four actions reuses the exact M2–M5 modal
-builders/queries/decision path unchanged — Home only adds a new entry point
-and a new Slack Events API endpoint (`/api/slack/events`) that listens for
-`app_home_opened` and republishes the tab. No web dashboard, no login, no
-new Slack scopes, no database migration. See [M6: App Home
+M6 adds a persistent **App Home** tab and makes it the **primary navigation
+surface** for ApproveFlow. Opening the Home tab shows a short intro, a
+single top-level **Create Request** button, a "My Requests" summary (your 3
+most recent, plus a **View all requests** button that appears once there
+are more than 3 — opening the same Request Center `/requests` uses), and a
+"Waiting for Me" summary (a count + button, or "Nothing is waiting for your
+approval." when there's nothing to decide). `/requests` remains a useful
+Slack shortcut that opens the exact same Request Center directly, for
+anyone who prefers typing a command over opening the Home tab. Every Home
+action reuses the exact M2–M5 modal builders/queries/decision path
+unchanged — Home only adds a new entry point and a new Slack Events API
+endpoint (`/api/slack/events`) that listens for `app_home_opened` and
+republishes the tab. No web dashboard, no login, no new Slack scopes, no
+database migration. See [M6: App Home
 architecture](#m6-app-home-architecture) below.
 
 ## Previously: M5 — Slack Request History & Request Details
@@ -900,7 +903,10 @@ For an accepted `app_home_opened`, `/api/slack/events`:
 3. Runs `listRequestsByRequester(workspace.id, viewer.id, 3)` and
    `listRequestsWaitingForApprover(workspace.id, viewer.id)` in parallel —
    the **exact same M5 functions**, just called with a smaller limit for the
-   first one (see below).
+   first one (see below). `listRequestsByRequester`'s `totalCount` (already
+   returned by the same query via Postgres's exact `count`, no extra query)
+   is passed straight through to the view builder — it decides whether "View
+   all requests" is worth showing, nothing else.
 4. Builds the view with `buildAppHomeView` and publishes it with
    `client.views.publish({ user_id, view })`.
 5. Any failure past step 1 is caught, logged (message only — never the bot
@@ -920,20 +926,32 @@ the same DIRECT/POLICY live-membership-aware query M5 already uses, so a
 policy member who's already decided, or been removed from a policy, is
 excluded from Home's count exactly as they are from the Request Center's.
 
-### The four Home actions — reuse, not a second system
+### The Home actions — reuse, not a second system
 
-| Home action | Action ID | Reuses |
-| --- | --- | --- |
-| **Create Request** | `create_request_home` (new) | `ensureDefaultRequestTypes` + `listActiveRequestTypes` + `buildRequestModal` — identical bootstrap to `/request`, including a freshly generated `idempotencyKey` |
-| **Open Request Center** | `open_request_center` (new) | `listRequestsByRequester` (default limit 10) + `listRequestsWaitingForApprover` + `buildRequestCenterView` — identical to `/requests` |
-| **View** (a My Requests row) | `view_request` (M5, unchanged) | `getRequestDetails` + `buildRequestDetailsView` |
-| **View pending approvals** | `view_waiting_requests` (M5, unchanged) | `listRequestsWaitingForApprover` + `buildWaitingListView` |
+Home has **no top-level "Open Request Center" button** — once App Home
+exists, it *is* the primary navigation surface, so a second general-purpose
+launcher button next to Create Request was redundant. What remains:
 
-The last two are the *same* action IDs and the *same* buttons M5 already
-renders inside the Request Center modal — Home's "My Requests" rows are
-built with the same exported `buildRequestRowBlocks` helper
-(`build-requests-views.ts`), so a click behaves identically no matter which
-surface it came from.
+| Home action | Action ID | Shown when | Reuses |
+| --- | --- | --- | --- |
+| **Create Request** | `create_request_home` (new) | Always | `ensureDefaultRequestTypes` + `listActiveRequestTypes` + `buildRequestModal` — identical bootstrap to `/request`, including a freshly generated `idempotencyKey` |
+| **View** (a My Requests row) | `view_request` (M5, unchanged) | One per shown row | `getRequestDetails` + `buildRequestDetailsView` |
+| **View all requests** | `open_request_center` (unchanged action id, relabeled + relocated) | Only when `myRequestsTotalCount > shown rows` — i.e. there's more than the 3 already visible | `listRequestsByRequester` (default limit 10) + `listRequestsWaitingForApprover` + `buildRequestCenterView` — identical to `/requests` |
+| **View pending approvals** | `view_waiting_requests` (M5, unchanged) | Only when Waiting for Me count > 0 | `listRequestsWaitingForApprover` + `buildWaitingListView` |
+
+"View all requests" sits under the "My Requests" section (not top-level)
+and reuses the *exact same* `open_request_center` action id and Request
+Center dispatch branch that existed before this UX refinement — only the
+button's placement, label, and visibility condition changed; the
+interactions route's handling of it is untouched. `/requests` still opens
+this identical Request Center directly, unconditionally, as a Slack
+shortcut for anyone who prefers typing a command.
+
+The row-level and pending-approvals actions are the *same* action IDs and
+the *same* buttons M5 already renders inside the Request Center modal —
+Home's "My Requests" rows are built with the same exported
+`buildRequestRowBlocks` helper (`build-requests-views.ts`), so a click
+behaves identically no matter which surface it came from.
 
 ### `views.open` vs. `views.push` — the one real behavioral difference
 
@@ -1073,19 +1091,26 @@ POLICY request in the workspace (from prior M4/M5 testing).
 On an account that has never submitted a request and has nothing pending:
 open the **Home** tab in the ApproveFlow app.
 
-- Intro/tagline, **Create Request**, and **Open Request Center** buttons
-  render.
-- My Requests shows "You haven't submitted any requests yet."
+- Intro/tagline and a single top-level **Create Request** button render —
+  there is no top-level "Open Request Center" button.
+- My Requests shows "You haven't submitted any requests yet." with **no**
+  "View all requests" button (nothing to view yet).
 - Waiting for Me shows "Nothing is waiting for your approval." — no button.
 
-### Test B — My Requests summary (capped at 3)
+### Test B — My Requests summary (capped at 3) and "View all requests"
 
-On an account with more than 3 requests submitted: open Home.
+On an account with **3 or fewer** requests submitted: open Home.
+
+- All of them appear, newest first, correct statuses.
+- **No** "View all requests" button — everything is already shown.
+
+On an account with **more than 3** requests submitted: open Home.
 
 - Exactly the 3 most recent appear (never more), newest first, correct
   statuses.
 - Compare against `/requests` on the same account — the same 3 requests
   (by id/status/resource) should be the top 3 there too.
+- A **View all requests** button appears below the 3 rows.
 
 ### Test C — Waiting for Me summary
 
@@ -1109,15 +1134,19 @@ On an account with more than 3 requests submitted: open Home.
    precedence, identical to the `/request` flow (M4 Test B) — the manually
    selected approver is never persisted as the approver.
 
-### Test E — Open Request Center from Home
+### Test E — "View all requests" from Home, and the `/requests` shortcut
 
-1. Click **Open Request Center** on Home.
+1. On an account with more than 3 requests, click **View all requests** on
+   Home (under My Requests).
 2. The exact same Request Center modal `/requests` opens — full My Requests
    list (up to 10) and Waiting for Me summary.
 3. From inside it, click **View** on a row → pushes Request Details onto the
    *same* modal (back arrow appears) — this is the unchanged M5 `views.push`
    path, not `views.open`, since this click originates from inside an
    already-open modal, not from Home.
+4. Separately, run `/requests` directly (not via Home) → the identical
+   Request Center opens immediately, confirming it remains a working
+   shortcut independent of Home.
 
 ### Test F — cross-workspace / uninstalled safety
 

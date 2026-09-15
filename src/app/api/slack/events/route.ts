@@ -70,12 +70,12 @@ export async function POST(request: NextRequest) {
   try {
     const viewer = await upsertSlackUser(workspace.id, parsed.slackUserId);
 
-    const [{ rows: recentRequests }, waitingRequests] = await Promise.all([
+    const [{ rows: recentRequests, totalCount: myRequestsTotalCount }, waitingRequests] = await Promise.all([
       listRequestsByRequester(workspace.id, viewer.id, HOME_RECENT_REQUESTS_LIMIT),
       listRequestsWaitingForApprover(workspace.id, viewer.id),
     ]);
 
-    const view = buildAppHomeView({ recentRequests, waitingCount: waitingRequests.length });
+    const view = buildAppHomeView({ recentRequests, myRequestsTotalCount, waitingCount: waitingRequests.length });
 
     const botToken = decryptBotToken({
       ciphertext: workspace.bot_access_token_ciphertext,
