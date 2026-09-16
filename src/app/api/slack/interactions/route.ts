@@ -178,7 +178,10 @@ async function handleRequestSubmission(payload: ViewSubmissionPayload): Promise<
       requester_id: requester.id,
       request_type_id: requestType.id,
       resource: result.data.resource,
-      reason: result.data.reason,
+      // M8: "Reason" was merged into "Details" (resource) in the modal — the
+      // column stays nullable and unpopulated for new requests rather than
+      // duplicating the Details text into it. See validate-request-submission.ts.
+      reason: null,
       requested_duration_minutes: result.data.requestedDurationMinutes,
       status: "PENDING",
       idempotency_key: result.data.idempotencyKey,
@@ -211,7 +214,7 @@ async function handleRequestSubmission(payload: ViewSubmissionPayload): Promise<
       requestId: inserted.id,
       requestTypeName: requestType.name,
       resource: result.data.resource,
-      reason: result.data.reason,
+      reason: null,
       requestedDurationMinutes: result.data.requestedDurationMinutes,
       requester: { slack_user_id: result.data.slackUserId, display_name: null },
       recipients,

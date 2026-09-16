@@ -54,8 +54,10 @@ export type RequestRoutingView =
 export interface RequestDetailsView {
   id: string;
   requestTypeName: string;
+  /** Customer-facing "Details". */
   resource: string;
-  reason: string;
+  /** M8: null for every new request (merged into Details) — non-null only for pre-M8 historical requests, which still show it as "Reason". */
+  reason: string | null;
   durationLabel: string;
   status: RequestStatus;
   createdAt: string;
@@ -179,18 +181,24 @@ export function buildRequestDetailsView({ details, banner }: BuildRequestDetails
     blocks.push({ type: "section", text: { type: "mrkdwn", text: `*${banner}*` } }, { type: "divider" });
   }
 
+  // M8: "Reason" only appears for pre-M8 historical requests that actually
+  // have one — new requests merge it into "Details" and never populate it,
+  // so there's nothing to (mis)render for them.
+  const detailFields: { type: "mrkdwn"; text: string }[] = [
+    { type: "mrkdwn", text: `*Request type:*\n${details.requestTypeName}` },
+    { type: "mrkdwn", text: `*Details:*\n${details.resource}` },
+  ];
+  if (details.reason) {
+    detailFields.push({ type: "mrkdwn", text: `*Reason:*\n${details.reason}` });
+  }
+  detailFields.push(
+    { type: "mrkdwn", text: `*When / Duration:*\n${details.durationLabel}` },
+    { type: "mrkdwn", text: `*Requester:*\n<@${details.requesterSlackUserId}>` },
+    { type: "mrkdwn", text: `*Status:*\n${formatStatusLabel(details.status)}` },
+  );
+
   blocks.push(
-    {
-      type: "section",
-      fields: [
-        { type: "mrkdwn", text: `*Request type:*\n${details.requestTypeName}` },
-        { type: "mrkdwn", text: `*Resource:*\n${details.resource}` },
-        { type: "mrkdwn", text: `*Reason:*\n${details.reason}` },
-        { type: "mrkdwn", text: `*Duration:*\n${details.durationLabel}` },
-        { type: "mrkdwn", text: `*Requester:*\n<@${details.requesterSlackUserId}>` },
-        { type: "mrkdwn", text: `*Status:*\n${formatStatusLabel(details.status)}` },
-      ],
-    },
+    { type: "section", fields: detailFields },
     { type: "context", elements: [{ type: "mrkdwn", text: `Requested ${formatSlackDate(details.createdAt)}` }] },
     { type: "divider" },
   );

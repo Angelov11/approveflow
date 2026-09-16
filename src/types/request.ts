@@ -30,8 +30,10 @@ export interface RequestRow {
   workspace_id: string;
   requester_id: string;
   request_type_id: string;
+  /** Customer-facing label: "Details" (see build-request-modal.ts) — column never renamed. */
   resource: string;
-  reason: string;
+  /** M8: nullable — new requests merge "Reason" into "Details" and leave this unpopulated. Historical rows keep their original value and still render it. */
+  reason: string | null;
   requested_duration_minutes: number | null;
   status: RequestStatus;
   idempotency_key: string;

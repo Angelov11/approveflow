@@ -36,7 +36,7 @@ export function buildAppHomeView({ recentRequests, myRequestsTotalCount, waiting
       type: "section",
       text: {
         type: "mrkdwn",
-        text: "*ApproveFlow*\nRequest access, get approvals, and track decisions — right here in Slack.",
+        text: "*ApproveFlow*\nSimple workplace approvals in Slack. Request time off, schedule changes, purchases, and more — without leaving Slack.",
       },
     },
     {

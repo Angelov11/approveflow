@@ -69,8 +69,8 @@ export function buildRequesterDecisionNotification({
 
   const fields: { type: "mrkdwn"; text: string }[] = [
     { type: "mrkdwn", text: `*Request type:*\n${requestTypeName}` },
-    { type: "mrkdwn", text: `*Resource:*\n${resource}` },
-    { type: "mrkdwn", text: `*Duration:*\n${durationLabel}` },
+    { type: "mrkdwn", text: `*Details:*\n${resource}` },
+    { type: "mrkdwn", text: `*When / Duration:*\n${durationLabel}` },
     { type: "mrkdwn", text: `*Status:*\n${decision}` },
   ];
   if (showDecidingApprover) {

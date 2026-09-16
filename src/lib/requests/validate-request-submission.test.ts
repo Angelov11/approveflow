@@ -3,23 +3,21 @@ import test from "node:test";
 import type { ViewSubmissionPayload } from "./validate-request-submission.ts";
 import { validateRequestSubmission } from "./validate-request-submission.ts";
 
-const validRequestTypeKeys = ["production_access", "deployment_approval", "custom"];
+const validRequestTypeKeys = ["vacation_time_off", "doctor_appointment", "other"];
 
 function buildPayload(
   overrides: {
     requestType?: string;
     resource?: string;
-    reason?: string;
     duration?: string;
     privateMetadata?: string;
     approver?: string | null;
   } = {},
 ): ViewSubmissionPayload {
   const {
-    requestType = "production_access",
-    resource = "AWS Production",
-    reason = "Need to debug an incident",
-    duration = "60",
+    requestType = "vacation_time_off",
+    resource = "Family vacation",
+    duration = "1440",
     privateMetadata = JSON.stringify({ idempotencyKey: "11111111-1111-1111-1111-111111111111" }),
     approver = "U0GARY123",
   } = overrides;
@@ -35,7 +33,6 @@ function buildPayload(
         values: {
           request_type_block: { request_type_select: { selected_option: { value: requestType } } },
           resource_block: { resource_input: { value: resource } },
-          reason_block: { reason_input: { value: reason } },
           duration_block: { duration_select: { selected_option: { value: duration } } },
           approver_block: { approver_select: { selected_user: approver ?? undefined } },
         },
@@ -50,15 +47,23 @@ test("valid submission is accepted", () => {
   if (result.ok) {
     assert.equal(result.data.slackTeamId, "T123");
     assert.equal(result.data.slackUserId, "U123");
-    assert.equal(result.data.requestTypeKey, "production_access");
-    assert.equal(result.data.resource, "AWS Production");
-    assert.equal(result.data.requestedDurationMinutes, 60);
+    assert.equal(result.data.requestTypeKey, "vacation_time_off");
+    assert.equal(result.data.resource, "Family vacation");
+    assert.equal(result.data.requestedDurationMinutes, 1440);
     assert.equal(result.data.idempotencyKey, "11111111-1111-1111-1111-111111111111");
     assert.equal(result.data.selectedApproverSlackId, "U0GARY123");
   }
 });
 
-test("not applicable duration resolves to null minutes", () => {
+test("no separate 'reason' field is collected — Details is the only free-text field", () => {
+  const result = validateRequestSubmission(buildPayload(), { validRequestTypeKeys });
+  assert.equal(result.ok, true);
+  if (result.ok) {
+    assert.ok(!("reason" in result.data));
+  }
+});
+
+test("'not applicable' / 'other, not specified' duration resolves to null minutes", () => {
   const result = validateRequestSubmission(buildPayload({ duration: "not_applicable" }), { validRequestTypeKeys });
   assert.equal(result.ok, true);
   if (result.ok) {
@@ -66,8 +71,28 @@ test("not applicable duration resolves to null minutes", () => {
   }
 });
 
+test("a multi-day duration option (e.g. '2 days') resolves correctly", () => {
+  const result = validateRequestSubmission(buildPayload({ duration: "2880" }), { validRequestTypeKeys });
+  assert.equal(result.ok, true);
+  if (result.ok) {
+    assert.equal(result.data.requestedDurationMinutes, 2880);
+  }
+});
+
 test("unknown request type is rejected with a field error", () => {
   const result = validateRequestSubmission(buildPayload({ requestType: "totally_made_up" }), { validRequestTypeKeys });
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.ok(result.errors.request_type_block);
+  }
+});
+
+test("a legacy/deactivated request type key is rejected the same as any other invalid key", () => {
+  // validRequestTypeKeys is resolved fresh from listActiveRequestTypes() by
+  // the caller — a legacy key like production_access simply won't be in it
+  // once deactivated, so it's rejected through the exact same "unknown
+  // request type" path as a fully made-up key. No special-casing needed.
+  const result = validateRequestSubmission(buildPayload({ requestType: "production_access" }), { validRequestTypeKeys });
   assert.equal(result.ok, false);
   if (!result.ok) {
     assert.ok(result.errors.request_type_block);
@@ -82,7 +107,7 @@ test("malformed/unknown duration is rejected with a field error", () => {
   }
 });
 
-test("empty resource is rejected", () => {
+test("empty details are rejected", () => {
   const result = validateRequestSubmission(buildPayload({ resource: "   " }), { validRequestTypeKeys });
   assert.equal(result.ok, false);
   if (!result.ok) {
@@ -90,15 +115,7 @@ test("empty resource is rejected", () => {
   }
 });
 
-test("empty reason is rejected", () => {
-  const result = validateRequestSubmission(buildPayload({ reason: "" }), { validRequestTypeKeys });
-  assert.equal(result.ok, false);
-  if (!result.ok) {
-    assert.ok(result.errors.reason_block);
-  }
-});
-
-test("oversized resource is rejected", () => {
+test("oversized details are rejected", () => {
   const result = validateRequestSubmission(buildPayload({ resource: "x".repeat(201) }), { validRequestTypeKeys });
   assert.equal(result.ok, false);
   if (!result.ok) {
@@ -112,12 +129,12 @@ test("missing/malformed private_metadata is rejected", () => {
 });
 
 test("multiple invalid fields all report their own errors", () => {
-  const result = validateRequestSubmission(buildPayload({ requestType: "bogus", resource: "", reason: "", duration: "bogus" }), {
+  const result = validateRequestSubmission(buildPayload({ requestType: "bogus", resource: "", duration: "bogus" }), {
     validRequestTypeKeys,
   });
   assert.equal(result.ok, false);
   if (!result.ok) {
-    assert.equal(Object.keys(result.errors).length, 4);
+    assert.equal(Object.keys(result.errors).length, 3);
   }
 });
 

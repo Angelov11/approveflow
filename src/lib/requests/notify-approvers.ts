@@ -17,7 +17,7 @@ export interface NotifyApproversParams {
   requestId: string;
   requestTypeName: string;
   resource: string;
-  reason: string;
+  reason: string | null;
   requestedDurationMinutes: number | null;
   requester: { slack_user_id: string; display_name: string | null };
   /**

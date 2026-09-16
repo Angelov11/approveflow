@@ -28,8 +28,10 @@ export interface BuildApprovalNotificationParams {
   requestId: string;
   requestTypeName: string;
   requester: { display_name: string | null; slack_user_id: string };
+  /** Customer-facing "Details". */
   resource: string;
-  reason: string;
+  /** M8: null for every new request (merged into Details) — non-null only for pre-M8 historical requests, which still show it. */
+  reason: string | null;
   durationLabel: string;
 }
 
@@ -45,6 +47,15 @@ export function buildApprovalNotification({
   const requesterMention = formatUserMention(requester);
   const buttonValue = JSON.stringify({ requestId });
 
+  const fields: { type: "mrkdwn"; text: string }[] = [
+    { type: "mrkdwn", text: `*Requester:*\n${requesterMention}` },
+    { type: "mrkdwn", text: `*Details:*\n${resource}` },
+  ];
+  if (reason) {
+    fields.push({ type: "mrkdwn", text: `*Reason:*\n${reason}` });
+  }
+  fields.push({ type: "mrkdwn", text: `*When / Duration:*\n${durationLabel}` });
+
   return {
     text: `New ${requestTypeName} request from ${requesterMention}`,
     blocks: [
@@ -54,12 +65,7 @@ export function buildApprovalNotification({
       },
       {
         type: "section",
-        fields: [
-          { type: "mrkdwn", text: `*Requester:*\n${requesterMention}` },
-          { type: "mrkdwn", text: `*Resource:*\n${resource}` },
-          { type: "mrkdwn", text: `*Reason:*\n${reason}` },
-          { type: "mrkdwn", text: `*Duration:*\n${durationLabel}` },
-        ],
+        fields,
       },
       {
         type: "context",

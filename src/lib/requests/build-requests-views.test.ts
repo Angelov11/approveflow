@@ -210,6 +210,28 @@ test("a banner renders when provided (stale-modal outcome messaging)", () => {
   assert.ok(blocksToText(view).includes("You're not authorized to decide on this request."));
 });
 
+// --- M8: workplace terminology ---
+
+test("uses 'Details' and 'When / Duration' labels, never 'Resource' or bare 'Duration'", () => {
+  const text = blocksToText(buildRequestDetailsView({ details: { ...baseDetails, reason: null } }));
+  assert.ok(text.includes("*Details:*"));
+  assert.ok(text.includes("*When / Duration:*"));
+  assert.ok(!text.includes("*Resource:*"));
+  assert.ok(!text.includes("*Duration:*"));
+});
+
+test("a pre-M8 historical request with a reason still shows a Reason field", () => {
+  const text = blocksToText(buildRequestDetailsView({ details: { ...baseDetails, reason: "Need it for testing" } }));
+  assert.ok(text.includes("*Reason:*"));
+  assert.ok(text.includes("Need it for testing"));
+});
+
+test("a new (post-M8) request with reason = null shows no Reason field at all — no placeholder", () => {
+  const text = blocksToText(buildRequestDetailsView({ details: { ...baseDetails, reason: null } }));
+  assert.ok(!text.includes("*Reason:*"));
+  assert.ok(!text.includes("No reason"));
+});
+
 test("details never expose internal UUIDs, routing_type strings, or column names", () => {
   const details: RequestDetailsView = {
     ...baseDetails,

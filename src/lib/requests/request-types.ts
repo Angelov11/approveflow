@@ -3,7 +3,14 @@ import "server-only";
 import { getSupabaseAdmin } from "@/lib/supabase/admin";
 import type { RequestType } from "@/types/request";
 
-/** Seeded per-workspace the first time a workspace needs them — never a shared/global row. */
+/**
+ * Seeded per-workspace the first time a workspace needs them — never a
+ * shared/global row. M8: this is the MVP's entire product surface —
+ * everyday workplace approvals, not the original AWS-access-shaped set
+ * (kept in the database for the workspaces that already used it; see the
+ * M8 migration that deactivates those keys going forward — never listed
+ * here again, so no newly-installed workspace ever gets them seeded).
+ */
 export const DEFAULT_REQUEST_TYPES: ReadonlyArray<{
   key: string;
   name: string;
@@ -11,32 +18,44 @@ export const DEFAULT_REQUEST_TYPES: ReadonlyArray<{
   requires_duration: boolean;
 }> = [
   {
-    key: "production_access",
-    name: "Production Access",
-    description: "Temporary access to production systems or data.",
+    key: "vacation_time_off",
+    name: "Vacation / Time Off",
+    description: "Planned time away from work.",
     requires_duration: true,
   },
   {
-    key: "deployment_approval",
-    name: "Deployment Approval",
-    description: "Approval to deploy a change.",
+    key: "doctor_appointment",
+    name: "Doctor Appointment",
+    description: "Time away for a medical appointment.",
+    requires_duration: true,
+  },
+  {
+    key: "work_from_home",
+    name: "Work From Home",
+    description: "Working remotely instead of in the office.",
+    requires_duration: true,
+  },
+  {
+    key: "personal_time",
+    name: "Personal Time",
+    description: "Time away for a personal matter.",
+    requires_duration: true,
+  },
+  {
+    key: "schedule_change",
+    name: "Schedule Change",
+    description: "A change to your usual working hours or shift.",
+    requires_duration: true,
+  },
+  {
+    key: "expense_purchase",
+    name: "Expense / Purchase",
+    description: "Approval for a work-related expense or purchase.",
     requires_duration: false,
   },
   {
-    key: "software_access",
-    name: "Software Access",
-    description: "Access to a software tool or service.",
-    requires_duration: false,
-  },
-  {
-    key: "purchase_approval",
-    name: "Purchase Approval",
-    description: "Approval for a purchase or expense.",
-    requires_duration: false,
-  },
-  {
-    key: "custom",
-    name: "Custom Request",
+    key: "other",
+    name: "Other Request",
     description: "Anything that doesn't fit the other categories.",
     requires_duration: false,
   },

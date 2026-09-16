@@ -1,7 +1,7 @@
 import type { WebClient } from "@slack/web-api";
 
-import { DURATION_OPTIONS } from "@/lib/requests/duration-options";
-import type { RequestType } from "@/types/request";
+import { DURATION_OPTIONS } from "./duration-options.ts";
+import type { RequestType } from "../../types/request.ts";
 
 /**
  * Derived from the installed @slack/web-api version's own `views.open`
@@ -14,8 +14,7 @@ export type ModalView = Parameters<WebClient["views"]["open"]>[0]["view"];
 
 export const REQUEST_MODAL_CALLBACK_ID = "approveflow_new_request";
 
-const MAX_RESOURCE_LENGTH = 200;
-const MAX_REASON_LENGTH = 2000;
+const MAX_DETAILS_LENGTH = 200;
 
 export interface BuildRequestModalParams {
   requestTypes: Pick<RequestType, "key" | "name">[];
@@ -23,6 +22,18 @@ export interface BuildRequestModalParams {
   idempotencyKey: string;
 }
 
+/**
+ * M8: the field set is Request Type / Details / When-Duration / Approver —
+ * the original separate "Reason" field was dropped as redundant with
+ * "Details" for everyday workplace requests ("Family vacation" doesn't need
+ * a separate justification field the way "Production Access" once did).
+ * The block_id/action_id for the Details field stays `resource_block`/
+ * `resource_input` internally — it still maps directly to the `resource`
+ * database column, which was never renamed (see the M8 migration notes for
+ * why renaming the column wasn't worth the churn); only the visible label
+ * changed. `reason` is still a valid, unpopulated-for-new-requests database
+ * column — see validate-request-submission.ts.
+ */
 export function buildRequestModal({ requestTypes, idempotencyKey }: BuildRequestModalParams): ModalView {
   return {
     type: "modal",
@@ -49,33 +60,22 @@ export function buildRequestModal({ requestTypes, idempotencyKey }: BuildRequest
       {
         type: "input",
         block_id: "resource_block",
-        label: { type: "plain_text", text: "Resource" },
+        label: { type: "plain_text", text: "Details" },
         element: {
           type: "plain_text_input",
           action_id: "resource_input",
-          max_length: MAX_RESOURCE_LENGTH,
-          placeholder: { type: "plain_text", text: "e.g. AWS Production" },
-        },
-      },
-      {
-        type: "input",
-        block_id: "reason_block",
-        label: { type: "plain_text", text: "Reason" },
-        element: {
-          type: "plain_text_input",
-          action_id: "reason_input",
-          multiline: true,
-          max_length: MAX_REASON_LENGTH,
+          max_length: MAX_DETAILS_LENGTH,
+          placeholder: { type: "plain_text", text: "e.g. Family vacation, dentist appointment, new monitor" },
         },
       },
       {
         type: "input",
         block_id: "duration_block",
-        label: { type: "plain_text", text: "Duration" },
+        label: { type: "plain_text", text: "When / Duration" },
         element: {
           type: "static_select",
           action_id: "duration_select",
-          placeholder: { type: "plain_text", text: "Select a duration" },
+          placeholder: { type: "plain_text", text: "Select when / how long" },
           options: DURATION_OPTIONS.map((option) => ({
             text: { type: "plain_text", text: option.label },
             value: option.value,

@@ -1,16 +1,46 @@
 # ApproveFlow
 
-ApproveFlow is a Slack-first approval and access-request application.
-Slack users will submit requests (production access, deployment approval,
-software access, purchase approval, custom approvals), approvers will
-approve/reject them directly in Slack, and ApproveFlow will maintain an
-audit trail. Later milestones may integrate with AWS, GitHub, Supabase
-auth providers, and Google Workspace to automatically grant/revoke
-temporary access.
+**ApproveFlow is lightweight employee/workplace approvals in Slack.** It
+solves "I need approval for something at work" — vacation and time off,
+doctor appointments, working from home, personal time, schedule changes,
+expenses and purchases, or anything else — not infrastructure access
+provisioning. A requester describes what they need and picks an approver
+(or, optionally, an admin configures a standing policy); the approver
+decides right in Slack; the requester is notified; the full history is
+always available from `/requests` or the App Home tab.
 
-## Current milestone: M7 — Decision Comments & Rejection Reasons
+**ApproveFlow is explicitly NOT:** an AWS/IAM access-provisioning product,
+an HRIS, a PTO-balance or leave-accrual system, or a calendar. It never
+asks for or stores any third-party infrastructure credentials (AWS, GitHub,
+Google Workspace, Okta, or otherwise), and it never provisions or revokes
+anything downstream — the approval decision itself *is* the entire product.
+An earlier direction (see "Previously" below) explored positioning this as
+an AWS-access-request tool; M8 deliberately narrowed the MVP to this
+simpler, more universal workplace-approvals scope instead.
 
-M7 gives Approve/Reject decisions context. Clicking **Approve** now opens a
+## Current milestone: M8 — MVP Product Simplification
+
+M8 doesn't add new plumbing — M2–M7's request/approval/notification/comment
+pipeline is untouched — it changes *what the product is for*. The default
+request types requesters see are now **Vacation / Time Off, Doctor
+Appointment, Work From Home, Personal Time, Schedule Change, Expense /
+Purchase, and Other Request**, in place of the original AWS-flavored set
+(Production Access, Deployment Approval, Software Access, Purchase
+Approval, Custom Request). The request modal is now **Request Type /
+Details / When-Duration / Approver** — "Resource" and "Reason" (both
+inherited AWS-access language) are gone from the customer-facing UI, merged
+into a single **Details** field. "Duration" is now **When / Duration**,
+with options that actually fit workplace requests (30 minutes up to 1
+week) instead of an access-grant's minutes-to-hours scale. DIRECT
+(requester-picks-an-approver) routing remains the zero-config MVP default;
+the POLICY engine is untouched and still available as an advanced,
+optional capability — see [M8: MVP Simplification
+architecture](#m8-mvp-simplification-architecture) below. **Not yet
+deployed** — pending migration review.
+
+## Previously: M7 — Decision Comments & Rejection Reasons
+
+M7 gave Approve/Reject decisions context. Clicking **Approve** opens a
 small modal with an optional **Comment** field; clicking **Reject** opens
 one with a **required Reason** field (blank/whitespace-only is rejected
 with a Slack-native validation error, never silently accepted). Submitting
@@ -19,12 +49,9 @@ same `decide_on_request()` RPC as every prior milestone — opening the modal
 itself grants no authorization at all. The comment/reason is persisted
 immutably on the `approvals` row, shown in Request Details next to the
 relevant decision, and included in the requester's final-decision
-notification. No new authorization model, no new database migration
-concept beyond two additive constraints on the already-existing
-`approvals.comment` column, no new Slack scope. See [M7: Decision Comments
-architecture](#m7-decision-comments-architecture) below. **Not yet
-deployed** — pending migration review (see [Production data inspection
-before migrating](#m7-production-data-inspection-before-migrating)).
+notification. No new authorization model, no new Slack scope. Deployed and
+production-verified (both DIRECT and POLICY paths). See [M7: Decision
+Comments architecture](#m7-decision-comments-architecture) below.
 
 ## Previously: M6 — Slack App Home
 
@@ -421,11 +448,18 @@ node --experimental-strip-types --env-file=.env.local \
 ```
 
 - `--team`: the Slack workspace's team ID (same value stored in `workspaces.slack_team_id`).
-- `--request-type`: one of the 5 default keys (`production_access`,
-  `deployment_approval`, `software_access`, `purchase_approval`, `custom`).
-  These only exist once `/request` has been run at least once in that
-  workspace (that's what seeds them) — run it once first if you get a "no
-  request type" error.
+- `--request-type`: any request type key that exists for that workspace —
+  as of M8 the default MVP keys are `vacation_time_off`,
+  `doctor_appointment`, `work_from_home`, `personal_time`,
+  `schedule_change`, `expense_purchase`, `other`. (Workspaces installed
+  before M8 also have the original `production_access`,
+  `deployment_approval`, `software_access`, `purchase_approval`, `custom`
+  rows — deactivated from new request *creation* but still fully valid here,
+  since policy configuration is a per-key operation independent of the
+  `active` flag; the existing Production Access policy from before M8
+  keeps working exactly as configured.) These only exist once a request has
+  been created at least once in that workspace (that's what seeds the
+  defaults) — create one first if you get a "no request type" error.
 - `--approver`: a Slack user ID, repeatable. Find one via a person's Slack
   profile → **⋯** → **Copy member ID**. This app has no scope to look users
   up by name.
@@ -1378,7 +1412,7 @@ committing and the notification call completing loses that one
 notification with no queue/retry, exactly the accepted M4 tradeoff. M7
 doesn't change this posture.
 
-## M7 end-to-end testing procedure (prepared, not yet executed — pending migration review)
+## M7 end-to-end testing procedure (completed — deployed and production-verified)
 
 Needs: both M7 migrations reviewed and pushed (`pnpm dlx supabase db push`,
 not run by me), and at least one workspace with both a DIRECT-eligible and a
@@ -1433,6 +1467,228 @@ approval row is created. **Do not alter production policy membership for
 this test without separate explicit approval** — this is the one scenario
 in the plan that touches shared configuration state, not just request data.
 
+## M8: MVP Simplification architecture
+
+### What M8 is, and what it deliberately isn't
+
+M8 is a product-scope change, not a re-architecture. Every piece of
+plumbing built in M1–M7 — Slack OAuth, request creation, DIRECT/POLICY
+routing and authorization, the atomic `decide_on_request()` RPC, Approve/
+Reject decision modals with comments, requester notifications, `/requests`,
+App Home — is completely unchanged. M8 only changes: which request types
+exist by default, the modal's field set/labels, and the duration option
+list. No new tables, no new routes, no new Slack scope, no new dependency.
+
+### Zero-config bootstrap already existed — M8 only changed *what* it seeds
+
+Before M8, a genuinely new Slack workspace could already go
+install → Home → Create Request → submit without anyone touching Supabase:
+`ensureDefaultRequestTypes(workspaceId)` (`src/lib/requests/request-types.ts`)
+is idempotent (`ON CONFLICT DO NOTHING` on `(workspace_id, key)`), safe on
+reinstall, and was already called at the start of both `/request`'s route
+and App Home's "Create Request" handler *before* M8 — this was M2/M6
+behavior, not something M8 needed to build. **M8's only change here is the
+contents of the `DEFAULT_REQUEST_TYPES` array** it seeds: the 7 workplace
+types below, replacing the original 5 AWS-access-shaped ones. A brand-new
+workspace installing today gets exactly and only the 7 new types, seeded
+automatically, with no admin step.
+
+### `request_types.active` already was the exact mechanism needed
+
+Hiding the old defaults from new request creation, without touching
+history, needed no schema change at all: `request_types.active` (boolean,
+M2) and `listActiveRequestTypes()`'s existing `.eq("active", true)` filter
+already do precisely this — a deactivated row is unselectable in the modal
+and rejected server-side by `validateRequestSubmission`'s
+`validRequestTypeKeys` check, while remaining a perfectly valid foreign key
+for every historical request, approval, and policy that already reference
+it. M8 needed one data migration (see below) to flip that flag for the 5
+legacy keys in the one workspace that already had them — new workspaces
+never see those keys at all, since they're no longer in
+`DEFAULT_REQUEST_TYPES`.
+
+### New default request types
+
+| Key | Label |
+| --- | --- |
+| `vacation_time_off` | Vacation / Time Off |
+| `doctor_appointment` | Doctor Appointment |
+| `work_from_home` | Work From Home |
+| `personal_time` | Personal Time |
+| `schedule_change` | Schedule Change |
+| `expense_purchase` | Expense / Purchase |
+| `other` | Other Request |
+
+Keys are internal only — never shown in any Slack surface, exactly like the
+5 keys they replace never were.
+
+### Legacy request types: deactivated, never deleted
+
+`production_access`, `deployment_approval`, `software_access`,
+`purchase_approval`, and `custom` are **not** removed from the database —
+deleting them would violate the `requests.request_type_id` and
+`approval_policies.request_type_id` foreign keys (`ON DELETE RESTRICT`
+and, for policies, plain `ON DELETE CASCADE` respectively — either way,
+deleting a still-referenced row is exactly the kind of history-destroying
+change this project has never done). Production, before this migration,
+had 16 historical requests against these keys (8 `custom`, 8
+`production_access`) and one active policy ("Production Access Approval")
+on `production_access` — all of that keeps working and rendering exactly
+as before. The migration below only sets `active = false` on those 5 rows;
+a brand-new user opening Create Request today sees only the 7 new types,
+while Request Details/notifications/the policy script still resolve and
+display the legacy ones normally by key, wherever history or an explicit
+admin script references them directly.
+
+**Tradeoff considered and rejected:** keeping legacy types selectable for
+the existing workspace while hiding them only for future ones. Rejected —
+it would mean two different "Create Request" experiences depending on
+which workspace you're in, undermining the entire point of an MVP-focused
+product surface, for a capability (creating a *new* Production
+Access-style request) nobody has asked to keep. A clean, identical list for
+every workspace was preferred.
+
+### Migrations
+
+Two new, additive migrations — neither edits a historical migration file:
+
+- **`20260916000000_relax_requests_reason_not_null.sql`** —
+  `ALTER TABLE requests ALTER COLUMN reason DROP NOT NULL`. The existing
+  `char_length(reason) BETWEEN 1 AND 2000` CHECK constraint (M2) needs no
+  change: Postgres treats a CHECK expression that evaluates to NULL as
+  satisfied (not failed) — `char_length(NULL)` is NULL, so `NULL BETWEEN 1
+  AND 2000` is NULL, which passes. Zero risk to history: every existing row
+  already has a non-null value satisfying the unchanged CHECK; this only
+  widens what's allowed going forward.
+- **`20260916000100_deactivate_legacy_request_types.sql`** — a pure data
+  fixup, `UPDATE request_types SET active = false WHERE key IN (...)` for
+  the 5 legacy keys, global (not scoped to one `workspace_id`) because no
+  workspace will ever be seeded with those keys again — any row with one of
+  them is by definition a pre-M8 install.
+
+### Details vs. Resource — why the column was never renamed
+
+The `resource` column is unchanged. Renaming it would touch every query,
+every type, and every historical row's column mapping for zero functional
+gain — the customer never sees the column name, only the modal's field
+*label*, which is now "Details" everywhere it's rendered (the request
+modal, Request Details, the approver DM, the requester notification). This
+is the same reasoning M6/M7 already applied to internal action IDs and
+callback IDs that don't match their current customer-facing label.
+
+### Reason: merged into Details, not duplicated
+
+The original design had two free-text fields — "Resource" (what) and
+"Reason" (why) — which made sense for "Production Access as a resource,
+debugging an incident as the reason" but is redundant for "Family vacation"
+or "Dentist appointment": there's nothing left to separately justify. New
+requests collect only **Details** (stored in `resource`, as above) and
+leave `reason` as `NULL` — never duplicated into both columns, which would
+read as a data-entry bug to anyone inspecting raw rows later. Every reason
+consumer (Request Details, the approver DM, the requester notification)
+renders a `*Reason:*` line only when one exists — present for every
+pre-M8 historical request, absent for every new one. No fabricated
+placeholder ever appears, matching the pattern M7 already established for
+optional decision comments.
+
+### When / Duration: still a fixed list, not a calendar
+
+The original duration options (30 minutes .. 8 hours .. 1 day) were shaped
+around temporary infrastructure access grants. Workplace requests routinely
+span multiple days (a week of vacation, a half-day appointment), which that
+scale had no way to express, so M8 replaces the list with: 30 minutes, 1
+hour, 2 hours, Half day, 1 day, 2 days, 3 days, 1 week, and "Other / Not
+specified" (`requested_duration_minutes = NULL`, same nullable column and
+`resolveDurationMinutes`/`formatDurationLabel` functions as before — only
+the option list changed). This is still a fixed Block Kit `static_select`,
+exactly like before — no calendar widget, no date-range picker, no
+business-day math, no PTO balance, no automatic expiration. A request for
+"Sep 21–25" is still expressed as selecting "1 week" (or "Other / Not
+specified" and describing the exact dates in Details) — deliberately a
+coarse, descriptive field, not structured HR data. A free-text "When"
+field was considered and rejected: a fixed list keeps `requested_duration_minutes`
+a real, queryable, comparable integer (already used by `formatDurationLabel`
+for display and by historical requests) rather than an unstructured string
+with no computable value at all.
+
+### Request modal: final field layout
+
+**Request Type → Details → When / Duration → Approver.** The native Slack
+`users_select` approver picker is unchanged and still required — M8 doesn't
+touch approver selection, org-chart lookup, or manager directories at all.
+DIRECT routing (the requester's selected approver) remains the zero-config
+default; if an active POLICY exists for the selected request type, M4's
+routing precedence is completely unchanged — POLICY still overrides the
+manually selected approver, exactly as it always has. None of the 7 new
+default types has a policy configured anywhere, so all of them route
+DIRECT out of the box; policies remain available as an explicit, optional,
+script-configured capability (see [Approval policy
+configuration](#approval-policy-configuration-optional-m3) above) for
+whoever wants that on top.
+
+### An incidental bug found and fixed while adding modal tests
+
+`build-request-modal.ts` had never had a unit test file before M8 (no prior
+milestone needed one). Adding one surfaced a latent bug: the file imported
+`DURATION_OPTIONS`/`RequestType` via the `@/` path alias, which — per this
+project's established constraint (see `verify-request.ts`'s and every other
+pure module's header comments) — never resolves under Node's test runner,
+only under Next's bundler. This was invisible in production (Next always
+resolved it correctly) but made the file untestable in isolation. Fixed by
+switching to the same relative `./`/`../` import style every other pure
+cross-imported module in this codebase already uses. Purely a testability
+fix — zero behavior change, confirmed by an unchanged build output.
+
+## M8 end-to-end testing procedure (prepared, not yet executed — pending migration review)
+
+Needs both M8 migrations reviewed and pushed (`pnpm dlx supabase db push`,
+not run by me).
+
+### Test A — fresh-workspace zero-config journey
+
+Cannot be run against the existing production ("Lord of the Rings")
+workspace without installing ApproveFlow into a genuinely separate Slack
+workspace — not performed as part of this milestone's implementation. When
+ready to verify:
+
+1. Install ApproveFlow into a brand-new Slack workspace (no prior
+   ApproveFlow history at all).
+2. Open the App Home tab → intro copy shows the new workplace-approvals
+   description, "Create Request" is the only top-level button, "My
+   Requests"/"Waiting for Me" both show their empty states.
+3. Click **Create Request** → the modal opens with **Request Type**
+   showing exactly the 7 new workplace types (no admin step, no script, no
+   dashboard visit) → **Details** → **When / Duration** → **Approver**.
+4. Fill in any type (e.g. "Vacation / Time Off"), Details ("Test vacation
+   request"), When/Duration ("1 week"), and select a second account as
+   Approver → Submit.
+5. Verify the approver receives a DM with **Details**/**When / Duration**
+   fields (no "Resource", no "Reason" line since none was collected) and
+   Approve/Reject buttons.
+6. Approver clicks Approve (via the M7 decision modal) → requester is
+   notified, using the same **Details**/**When / Duration** terminology.
+7. Confirm in the database: `routing_type = 'DIRECT'`, `reason IS NULL`,
+   `request_type_id` resolves to one of the 7 new keys — no policy
+   configuration exists anywhere for that workspace.
+
+### Test B — existing production workspace, post-migration
+
+1. Open App Home / run `/request` in the existing workspace → Request Type
+   shows only the 7 new types — none of the 5 legacy ones appear.
+2. Open a pre-M8 historical request in Request Details (e.g. a `Custom
+   Request` or `Production Access` one) → still renders correctly,
+   including its original **Reason** line (non-null, pre-M8 data) and
+   correct historical routing/decision information.
+3. Confirm the existing "Production Access Approval" policy is still
+   `active = true` in the database and its members are unchanged — it is
+   simply unreachable from new request creation now, not broken.
+
+### Test C — regression
+
+Run through one full DIRECT approve-with-comment cycle (M7's Test A) using
+a new MVP request type, to confirm the M3–M7 decision/notification pipeline
+is completely unaffected by the M8 vocabulary/default changes.
+
 ## Project structure
 
 ```
@@ -1469,13 +1725,15 @@ src/
       parse-slack-event.ts        # pure (M6): Events API envelope classifier — url_verification / app_home_opened / ignored (unit tested)
       parse-slack-event.test.ts
     requests/
-      duration-options.ts         # pure: shared duration select options + labels
-      request-types.ts            # server-only: default request types + idempotent seeding
+      duration-options.ts         # pure: shared "When / Duration" select options + labels (M8: workplace-shaped range, unit tested)
+      duration-options.test.ts
+      request-types.ts            # server-only: default request types + idempotent seeding (M8: 7 workplace types replace the original 5)
       workspace-lookup.ts         # server-only: workspace/user lookup+upsert
-      build-request-modal.ts      # pure: Block Kit modal builder (incl. M4 Approver users_select)
-      validate-request-submission.ts  # pure: view_submission validation (unit tested)
+      build-request-modal.ts      # pure: Block Kit modal builder — Request Type / Details / When-Duration / Approver (M8; unit tested)
+      build-request-modal.test.ts
+      validate-request-submission.ts  # pure: view_submission validation (unit tested; M8: no separate Reason field)
       validate-request-submission.test.ts
-      build-approval-notification.ts  # pure: approver DM builder, message update, outcome text
+      build-approval-notification.ts  # pure: approver DM builder, message update, outcome text (M8: Details/When-Duration terminology, optional Reason)
       parse-block-action.ts       # pure: block_actions (Approve/Reject) validation — message- and modal-origin (unit tested; M7: now also requires trigger_id)
       parse-block-action.test.ts
       build-decision-modal.ts     # pure (M7): Approve/Reject decision modal builder — optional Comment / required Reason (unit tested)
@@ -1484,7 +1742,7 @@ src/
       validate-decision-submission.test.ts
       compute-decision-outcome.ts # pure mirror of decide_on_request()'s algorithm (unit tested; both routing models)
       compute-decision-outcome.test.ts
-      build-requester-decision-notification.ts  # pure: final-decision requester DM + notification gating (M7: + comment/reason rendering)
+      build-requester-decision-notification.ts  # pure: final-decision requester DM + notification gating (M7: + comment/reason rendering; M8: Details/When-Duration terminology)
       build-requester-decision-notification.test.ts
       approval-actions.ts         # server-only: decide_on_request() RPC wrapper (M7: + comment param)
       approval-policies.ts        # server-only: active-policy lookup + policy recipient list
@@ -1494,16 +1752,16 @@ src/
       status-display.test.ts
       parse-requests-action.ts    # pure (M5, extended M6): /requests + Home navigation click validation, incl. views.open vs. views.push origin (unit tested)
       parse-requests-action.test.ts
-      build-requests-views.ts     # pure (M5): Request Center / Waiting List / Request Details Block Kit views (unit tested)
+      build-requests-views.ts     # pure (M5): Request Center / Waiting List / Request Details Block Kit views (unit tested; M8: Details/When-Duration terminology, optional Reason)
       build-requests-views.test.ts
-      build-app-home-view.ts      # pure (M6): App Home Block Kit view builder, reuses build-requests-views' row builder (unit tested)
+      build-app-home-view.ts      # pure (M6): App Home Block Kit view builder, reuses build-requests-views' row builder (unit tested; M8: updated intro copy)
       build-app-home-view.test.ts
       request-views.ts            # server-only (M5, extended M6/M7): listRequestsByRequester (optional limit), listRequestsWaitingForApprover, getRequestDetails (M7: + approval comment)
     supabase/
       admin.ts                    # server-only: service-role Supabase client
   types/
     workspace.ts                  # Workspace row type
-    request.ts                    # User, RequestType, RequestRow types (incl. M4 routing fields)
+    request.ts                    # User, RequestType, RequestRow types (incl. M4 routing fields; M8: reason is nullable)
     approval.ts                   # ApprovalPolicy, Approval, DecideOnRequestResult types
 
 scripts/
@@ -1523,6 +1781,8 @@ supabase/
     *_enforce_direct_approval_threshold.sql
     # M5 adds no migration — the existing schema already had everything needed.
     # M6 adds no migration either — Home is a read-mostly front door over the existing schema.
-    *_add_approval_comment_constraints.sql          # M7 — NOT YET PUSHED, pending review
-    *_update_decide_on_request_for_comment_validation.sql  # M7 — NOT YET PUSHED, pending review
+    *_add_approval_comment_constraints.sql          # M7 — deployed
+    *_update_decide_on_request_for_comment_validation.sql  # M7 — deployed
+    *_relax_requests_reason_not_null.sql            # M8 — NOT YET PUSHED, pending review
+    *_deactivate_legacy_request_types.sql           # M8 — NOT YET PUSHED, pending review
 ```
