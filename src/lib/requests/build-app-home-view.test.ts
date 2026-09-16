@@ -13,6 +13,7 @@ const sampleRequest: RequestSummary = {
   resource: "AWS Test Resource",
   status: "PENDING",
   whenText: "2 hours",
+  amountText: null,
   createdAt: "2026-09-15T20:00:00.000Z",
 };
 

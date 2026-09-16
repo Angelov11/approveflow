@@ -13,9 +13,10 @@ import {
   REJECT_DECISION_CALLBACK_ID,
   type DecisionModalSource,
 } from "@/lib/requests/build-decision-modal";
-import { buildRequestModal, REQUEST_MODAL_CALLBACK_ID } from "@/lib/requests/build-request-modal";
+import { buildRequestModal, REQUEST_MODAL_CALLBACK_ID, REQUEST_TYPE_SELECT_ACTION_ID, type PreservedRequestFields } from "@/lib/requests/build-request-modal";
 import { buildErrorView, buildRequestCenterView, buildRequestDetailsView, buildWaitingListView, type ModalView } from "@/lib/requests/build-requests-views";
 import { isFinalDecisionTransition } from "@/lib/requests/build-requester-decision-notification";
+import { EXPENSE_AMOUNT_ACTION_ID, EXPENSE_AMOUNT_BLOCK_ID, EXPENSE_CURRENCY_ACTION_ID, EXPENSE_CURRENCY_BLOCK_ID } from "@/lib/requests/expense";
 import { notifyApprovers, type NotificationRecipient } from "@/lib/requests/notify-approvers";
 import { notifyRequesterOfDecision } from "@/lib/requests/notify-requester";
 import { parseApprovalBlockAction, type BlockActionsPayload } from "@/lib/requests/parse-block-action";
@@ -28,7 +29,19 @@ import {
   type RequestsNavigationPayload,
 } from "@/lib/requests/parse-requests-action";
 import { getRequestDetails, listRequestsByRequester, listRequestsWaitingForApprover } from "@/lib/requests/request-views";
+import { getRequestTypeFieldConfig, remapExpenseForModeChange, remapTimingForModeChange } from "@/lib/requests/request-type-config";
 import { ensureDefaultRequestTypes, listActiveRequestTypes } from "@/lib/requests/request-types";
+import {
+  END_DATE_ACTION_ID,
+  END_DATE_BLOCK_ID,
+  END_TIME_ACTION_ID,
+  END_TIME_BLOCK_ID,
+  START_DATE_ACTION_ID,
+  START_DATE_BLOCK_ID,
+  START_TIME_ACTION_ID,
+  START_TIME_BLOCK_ID,
+  type RequestTiming,
+} from "@/lib/requests/request-timing";
 import { validateDecisionSubmission, type DecisionSubmissionPayload } from "@/lib/requests/validate-decision-submission";
 import { validateRequestSubmission, type ViewSubmissionPayload } from "@/lib/requests/validate-request-submission";
 import { findWorkspaceBySlackTeamId, upsertSlackUser } from "@/lib/requests/workspace-lookup";
@@ -88,6 +101,9 @@ export async function POST(request: NextRequest) {
       actionId === CREATE_REQUEST_ACTION_ID
     ) {
       return handleRequestsNavigation(payload as RequestsNavigationPayload);
+    }
+    if (actionId === REQUEST_TYPE_SELECT_ACTION_ID) {
+      return handleRequestTypeChanged(payload as RequestTypeChangedPayload);
     }
     // Not one of our recognized actions — ignore safely.
     return ack();
@@ -190,6 +206,8 @@ async function handleRequestSubmission(payload: ViewSubmissionPayload): Promise<
       requested_start_time: result.data.timing.startTime,
       requested_end_date: result.data.timing.endDate,
       requested_end_time: result.data.timing.endTime,
+      requested_amount: result.data.expense.amount,
+      requested_currency: result.data.expense.currency,
       status: "PENDING",
       idempotency_key: result.data.idempotencyKey,
       ...routingFields,
@@ -223,6 +241,7 @@ async function handleRequestSubmission(payload: ViewSubmissionPayload): Promise<
       resource: result.data.resource,
       reason: null,
       timing: result.data.timing,
+      expense: result.data.expense,
       requester: { slack_user_id: result.data.slackUserId, display_name: null },
       recipients,
     });
@@ -231,6 +250,113 @@ async function handleRequestSubmission(payload: ViewSubmissionPayload): Promise<
   }
 
   // Empty body closes the modal normally.
+  return ack();
+}
+
+/**
+ * Minimal shape of the `block_actions` payload fired by the Request Type
+ * select's `dispatch_action: true` (see build-request-modal.ts). Selecting
+ * a new option in a modal echoes back the *entire current view*, including
+ * `id`/`hash` (needed for `views.update`) and `state.values` for every
+ * field rendered so far — that live state is the only source used to carry
+ * compatible input forward into the rebuilt modal.
+ */
+interface RequestTypeChangedPayload {
+  type?: string;
+  team?: { id?: string };
+  user?: { id?: string };
+  actions?: { action_id?: string; selected_option?: { value?: string } }[];
+  view?: {
+    id?: string;
+    hash?: string;
+    private_metadata?: string;
+    state?: {
+      values?: Record<
+        string,
+        Record<string, { value?: string | null; selected_option?: { value?: string } | null; selected_user?: string | null; selected_date?: string | null; selected_time?: string | null }>
+      >;
+    };
+  };
+}
+
+function readCurrentField(payload: RequestTypeChangedPayload, blockId: string, actionId: string): string | null {
+  const field = payload.view?.state?.values?.[blockId]?.[actionId];
+  return field?.selected_option?.value ?? field?.selected_user ?? field?.selected_date ?? field?.selected_time ?? field?.value ?? null;
+}
+
+/**
+ * The dynamic-modal step: selecting a Request Type re-renders the Create
+ * Request modal in place with that type's field set (see
+ * request-type-config.ts). This is UI state only — it never touches the
+ * database beyond re-reading the workspace's active request types (the
+ * exact same authoritative list the eventual submission is validated
+ * against), and it never decides or authorizes anything. `views.update`
+ * uses `view_id`/`hash` from the payload itself, not a `trigger_id` — same
+ * mechanism M5/M7 already use to reflect a decision outcome in place.
+ */
+async function handleRequestTypeChanged(payload: RequestTypeChangedPayload): Promise<Response> {
+  const slackTeamId = payload.team?.id;
+  const viewId = payload.view?.id;
+  const newTypeKey = payload.actions?.[0]?.selected_option?.value;
+  if (!slackTeamId || !viewId || !newTypeKey) {
+    return ack();
+  }
+
+  let idempotencyKey: string | undefined;
+  try {
+    const metadata = payload.view?.private_metadata ? JSON.parse(payload.view.private_metadata) : undefined;
+    idempotencyKey = typeof metadata?.idempotencyKey === "string" ? metadata.idempotencyKey : undefined;
+  } catch {
+    idempotencyKey = undefined;
+  }
+  if (!idempotencyKey) {
+    return ack();
+  }
+
+  const workspace = await findWorkspaceBySlackTeamId(slackTeamId);
+  if (!workspace) {
+    return ack();
+  }
+
+  try {
+    const requestTypes = await listActiveRequestTypes(workspace.id);
+    const newConfig = getRequestTypeFieldConfig(newTypeKey);
+
+    const currentTiming: RequestTiming = {
+      startDate: readCurrentField(payload, START_DATE_BLOCK_ID, START_DATE_ACTION_ID),
+      startTime: readCurrentField(payload, START_TIME_BLOCK_ID, START_TIME_ACTION_ID),
+      endDate: readCurrentField(payload, END_DATE_BLOCK_ID, END_DATE_ACTION_ID),
+      endTime: readCurrentField(payload, END_TIME_BLOCK_ID, END_TIME_ACTION_ID),
+    };
+    const currentExpense = {
+      amount: readCurrentField(payload, EXPENSE_AMOUNT_BLOCK_ID, EXPENSE_AMOUNT_ACTION_ID),
+      currency: readCurrentField(payload, EXPENSE_CURRENCY_BLOCK_ID, EXPENSE_CURRENCY_ACTION_ID),
+    };
+
+    const preserved: PreservedRequestFields = {
+      // Details and Approver are universal — always carried over verbatim.
+      resource: readCurrentField(payload, "resource_block", "resource_input"),
+      approverSlackId: readCurrentField(payload, "approver_block", "approver_select"),
+      timing: remapTimingForModeChange(currentTiming, newConfig.timingMode),
+      expense: remapExpenseForModeChange(currentExpense, newConfig.expense),
+    };
+
+    const view = buildRequestModal({ requestTypes, idempotencyKey, selectedTypeKey: newTypeKey, preserved });
+
+    const botToken = decryptBotToken({
+      ciphertext: workspace.bot_access_token_ciphertext,
+      iv: workspace.bot_access_token_iv,
+      authTag: workspace.bot_access_token_auth_tag,
+    });
+    const client = new WebClient(botToken);
+    await client.views.update({ view_id: viewId, hash: payload.view?.hash, view } as Parameters<typeof client.views.update>[0]);
+  } catch (error) {
+    // Best-effort — includes a possible hash_conflict from rapid repeated
+    // type changes racing each other; either way, nothing was corrupted,
+    // the requester just doesn't see this particular update reflected.
+    console.error("Failed to rebuild Create Request modal for the new type:", error instanceof Error ? error.message : "unknown error");
+  }
+
   return ack();
 }
 
@@ -308,7 +434,7 @@ async function rebuildApprovalMessageContent(workspaceId: string, requestId: str
   const { data: request, error } = await supabase
     .from("requests")
     .select(
-      "resource, reason, requested_duration_minutes, requested_start_date, requested_start_time, requested_end_date, requested_end_time, request_types(name), users!requests_requester_id_fkey(slack_user_id)",
+      "resource, reason, requested_duration_minutes, requested_start_date, requested_start_time, requested_end_date, requested_end_time, requested_amount, requested_currency, request_types(name), users!requests_requester_id_fkey(slack_user_id)",
     )
     .eq("id", requestId)
     .eq("workspace_id", workspaceId)
@@ -334,6 +460,7 @@ async function rebuildApprovalMessageContent(workspaceId: string, requestId: str
       endTime: request.requested_end_time,
     },
     legacyDurationMinutes: request.requested_duration_minutes,
+    expense: { amount: request.requested_amount, currency: request.requested_currency },
   });
 }
 

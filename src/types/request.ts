@@ -34,7 +34,16 @@ export interface RequestRow {
   resource: string;
   /** M8: nullable — new requests merge "Reason" into "Details" and leave this unpopulated. Historical rows keep their original value and still render it. */
   reason: string | null;
+  /** Historical-only (M2-M7 fixed dropdown) — see duration-options.ts. NULL for every new request. */
   requested_duration_minutes: number | null;
+  /** M8 correction: literal local date/time values, no timezone conversion — see request-timing.ts. NULL for every pre-correction historical request and for any type/field combination that doesn't collect it. */
+  requested_start_date: string | null;
+  requested_start_time: string | null;
+  requested_end_date: string | null;
+  requested_end_time: string | null;
+  /** M8 (request-type-aware correction): Expense / Purchase only — see expense.ts. NULL for every other request type. */
+  requested_amount: number | null;
+  requested_currency: string | null;
   status: RequestStatus;
   idempotency_key: string;
   routing_type: RoutingType;

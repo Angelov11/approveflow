@@ -47,7 +47,7 @@ export async function notifyRequesterOfDecision({
   const { data: request, error: requestError } = await supabase
     .from("requests")
     .select(
-      "resource, requested_duration_minutes, requested_start_date, requested_start_time, requested_end_date, requested_end_time, routing_type, requester_id, request_type_id",
+      "resource, requested_duration_minutes, requested_start_date, requested_start_time, requested_end_date, requested_end_time, requested_amount, requested_currency, routing_type, requester_id, request_type_id",
     )
     .eq("id", requestId)
     .single();
@@ -112,6 +112,7 @@ export async function notifyRequesterOfDecision({
     resource: request.resource,
     timing,
     legacyDurationMinutes: request.requested_duration_minutes,
+    expense: { amount: request.requested_amount, currency: request.requested_currency },
     routingType: request.routing_type,
     decidingApproverSlackId,
     comment: decisionCommentResult.data?.comment ?? null,

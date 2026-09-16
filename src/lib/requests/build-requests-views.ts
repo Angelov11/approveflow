@@ -30,8 +30,10 @@ export interface RequestSummary {
   requestTypeName: string;
   resource: string;
   status: RequestStatus;
-  /** Precomputed by request-views.ts via request-timing.ts's formatWhenLabel — null when there's genuinely nothing to show (never rendered as a placeholder). */
+  /** Precomputed by request-views.ts via request-timing.ts's formatWhenLabel — null when there's genuinely nothing to show (never rendered as a placeholder). Mutually exclusive with `amountText` by construction (a request is either timed or expense-bearing, never both). */
   whenText: string | null;
+  /** Precomputed by request-views.ts via expense.ts's formatAmountLabel — null for every non-expense request. */
+  amountText: string | null;
   createdAt: string;
 }
 
@@ -60,8 +62,10 @@ export interface RequestDetailsView {
   resource: string;
   /** M8: null for every new request (merged into Details) — non-null only for pre-M8 historical requests, which still show it as "Reason". */
   reason: string | null;
-  /** Precomputed by request-views.ts via request-timing.ts's formatWhenLabel — null when there's genuinely nothing to show (field omitted entirely, never a placeholder). */
+  /** Precomputed by request-views.ts via request-timing.ts's formatWhenLabel — null when there's genuinely nothing to show (field omitted entirely, never a placeholder). Mutually exclusive with `amountLabel` by construction. */
   when: WhenLabel | null;
+  /** Precomputed by request-views.ts via expense.ts's formatAmountLabel — null for every non-expense request. */
+  amountLabel: string | null;
   status: RequestStatus;
   createdAt: string;
   requesterSlackUserId: string;
@@ -74,7 +78,8 @@ export interface RequestDetailsView {
 /** Exported for reuse by the App Home builder (M6) — Home's "My Requests" rows are the exact same shape as the Request Center's. */
 export function buildRequestRowBlocks(requests: RequestSummary[]): unknown[] {
   return requests.map((r) => {
-    const timingLine = r.whenText ? `${r.whenText} · ` : "";
+    const summaryText = r.whenText ?? r.amountText;
+    const timingLine = summaryText ? `${summaryText} · ` : "";
     return {
       type: "section",
       text: {
@@ -199,6 +204,9 @@ export function buildRequestDetailsView({ details, banner }: BuildRequestDetails
   }
   if (details.when) {
     detailFields.push({ type: "mrkdwn", text: `*${details.when.label}:*\n${details.when.value}` });
+  }
+  if (details.amountLabel) {
+    detailFields.push({ type: "mrkdwn", text: `*Amount:*\n${details.amountLabel}` });
   }
   detailFields.push(
     { type: "mrkdwn", text: `*Requester:*\n<@${details.requesterSlackUserId}>` },

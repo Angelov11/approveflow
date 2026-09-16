@@ -26,22 +26,26 @@ request types requesters see are now **Vacation / Time Off, Doctor
 Appointment, Work From Home, Personal Time, Schedule Change, Expense /
 Purchase, and Other Request**, in place of the original AWS-flavored set
 (Production Access, Deployment Approval, Software Access, Purchase
-Approval, Custom Request). The request modal is now **Request Type /
-Details / Start date / Start time / End date / End time / Approver** —
-"Resource" and "Reason" (both inherited AWS-access language) are gone from
-the customer-facing UI, merged into a single **Details** field, and the
-original fixed "Duration" dropdown (30 minutes .. 1 week) has been replaced
-entirely by native Slack date/time pickers, because a dropdown could say "1
-week" but never *which* week. All four date/time fields are optional —
-some requests (e.g. Expense / Purchase) don't need timing at all — and are
-stored/shown as the literal local values the requester picked, with no
-timezone conversion of any kind. DIRECT (requester-picks-an-approver)
-routing remains the zero-config MVP default; the POLICY engine is untouched
-and still available as an advanced, optional capability; legacy technical
-request types remain in the database for historical rendering but are
-deactivated for new request creation — see [M8: MVP Simplification
-architecture](#m8-mvp-simplification-architecture) below. **Not yet
-deployed** — pending migration review.
+Approval, Custom Request). "Resource" and "Reason" (both inherited
+AWS-access language) are gone from the customer-facing UI, merged into a
+single universal **Details** field.
+
+The Create Request modal is now **request-type-aware**: it dynamically
+re-renders (via `views.update`, triggered by the Request Type field's
+`dispatch_action`) to show only the fields that actually make sense for the
+selected type — a day-level date range for Vacation/WFH/Personal Time, a
+single date plus a start/end time for Doctor Appointment/Schedule Change,
+an Amount+Currency pair for Expense/Purchase, and the full flexible
+optional-timing shape for Other Request. See [M8: MVP Simplification
+architecture](#m8-mvp-simplification-architecture) below for the full field
+matrix, the dynamic-modal mechanism, and the centralized
+`request-type-config.ts` that drives modal building, submission validation,
+and input preservation from one shared definition. DIRECT
+(requester-picks-an-approver) routing remains the zero-config MVP default;
+the POLICY engine is untouched and still available as an advanced, optional
+capability; legacy technical request types remain in the database for
+historical rendering but are deactivated for new request creation. **Not
+yet deployed** — pending migration review.
 
 ## Previously: M7 — Decision Comments & Rejection Reasons
 
@@ -1555,7 +1559,7 @@ every workspace was preferred.
 
 ### Migrations
 
-Three additive migrations — none edits a historical migration file:
+Four additive migrations — none edits a historical migration file:
 
 - **`20260916000000_relax_requests_reason_not_null.sql`** —
   `ALTER TABLE requests ALTER COLUMN reason DROP NOT NULL`. The existing
@@ -1578,6 +1582,17 @@ Three additive migrations — none edits a historical migration file:
   below). All 5 are immediately valid (not `NOT VALID`) — these are
   brand-new columns, so every existing row has `NULL` in all four,
   trivially satisfying every condition.
+- **`20260916020000_add_request_expense_fields.sql`** (not yet pushed) —
+  adds `requested_amount numeric(10,2)` and `requested_currency text`
+  (both nullable) plus two CHECK constraints, `requests_amount_positive`
+  (`requested_amount IS NULL OR requested_amount > 0`) and
+  `requests_currency_valid` (`requested_currency IS NULL OR
+  requested_currency IN ('USD','EUR','GBP','MKD','CAD','AUD')`). Both are
+  immediately valid for the same reason as above — brand-new columns, every
+  existing row is `NULL` in both. See [Expense / Purchase: amount and
+  currency](#expense--purchase-amount-and-currency) below for why a
+  type-coupling rule like "Expense / Purchase requires an amount" is
+  deliberately **not** one of these constraints.
 
 ### Details vs. Resource — why the column was never renamed
 
@@ -1636,40 +1651,229 @@ UTC) to convert into, which risks misrepresenting what the requester
 actually meant. A `date`/`time` pair makes no such claim — it's just the
 human value as entered.
 
-All four fields are optional independently, because not every request
-needs timing at all — "Expense / Purchase" routinely has none. Business
-rules (never invented, only rejected when nonsensical) are enforced
-identically in the Slack modal's own validation and in a 5-constraint
-CHECK-constraint backstop at the database level (see [Migrations](#migrations)
-above and [Request Details](#request-details) below for how "nothing
-supplied" renders): a start time needs a start date; an end date needs a
-start date; an end time needs an end date; the end date can't be before
-the start date; and when start and end land on the exact same calendar
-date with both times present, the end time must be strictly after the
-start time. Critically, a same-day or multi-day range is never rejected
-just because *one side's* time was left blank — only ever having both a
-date pair and both times, with the times in the wrong order, is invalid.
+The 5-constraint CHECK-constraint backstop at the database level (see
+[Migrations](#migrations) above and [Request Details](#request-details)
+below for how "nothing supplied" renders) mirrors this app-level validation
+exactly: a start time needs a start date; an end date needs a start date;
+an end time needs an end date; the end date can't be before the start
+date; and when start and end land on the exact same calendar date with
+both times present, the end time must be strictly after the start time.
+Critically, a same-day or multi-day range is never rejected just because
+*one side's* time was left blank — only ever having both a date pair and
+both times, with the times in the wrong order, is invalid.
 
 No calendar integration, no PTO balance, no leave accrual, no
 business-day math, and no automatic expiration exist anywhere in this
-design — these are still four plain, independent form fields, not a
-scheduling system.
+design — these are still plain date/time form fields, not a scheduling
+system.
 
-### Request modal: final field layout
+### One more correction: a universal field set was still the wrong shape
 
-**Request Type → Details → Start date → Start time → End date → End time →
-Approver.** The native Slack `users_select` approver picker is unchanged
-and still required — M8 doesn't touch approver selection, org-chart
-lookup, or manager directories at all, and its former hint text explaining
-policy-vs-manual routing (an internal implementation detail) was removed —
-ordinary employees don't need to know or think about it. DIRECT routing
-(the requester's selected approver) remains the zero-config default; if an
-active POLICY exists for the selected request type, M4's routing
-precedence is completely unchanged — POLICY still overrides the manually
-selected approver, exactly as it always has. None of the 7 new default
-types has a policy configured anywhere, so all of them route DIRECT out of
-the box; policies remain available as an explicit, optional,
-script-configured capability (see [Approval policy
+The four-field design above (all optional, identical for every request
+type) shipped and passed a first round of real Slack testing, but broader
+usage exposed a second UX problem: showing the *same* Start date/Start
+time/End date/End time fields for every type is confusing when most types
+don't need all four. A Vacation request never needs times. A Doctor
+Appointment needs exactly one date (asking for a "Start date" *and* an
+"End date" when it's the same day reads as broken). An Expense / Purchase
+needs no timing at all — it needs an amount and a currency instead, which
+the original design had no field for whatsoever. "Other Request" is the
+one case that genuinely benefits from full flexibility, since by
+definition it's the type that doesn't fit a more specific shape.
+
+The corrected design makes the Create Request modal **request-type-aware**
+instead of universal: the fields shown depend on the currently selected
+Request Type, driven by one centralized configuration object rather than
+scattered per-field conditionals.
+
+### Centralized field configuration: `request-type-config.ts`
+
+`REQUEST_TYPE_FIELD_CONFIG` (`src/lib/requests/request-type-config.ts`) is
+the single source of truth for which fields a given request type key
+shows, consumed identically by the modal builder, the submission
+validator, and the dynamic re-render/input-preservation logic below — none
+of those three places contains its own `if (type === "vacation_time_off")`
+branching; they all call `getRequestTypeFieldConfig(key)` and act on the
+returned `{ timingMode, expense }` pair. An unrecognized or legacy type key
+(e.g. `production_access`) safely falls back to the most permissive shape
+(`OPTIONAL_RANGE`, no expense fields) rather than throwing.
+
+`timingMode` is one of four values:
+
+| `timingMode` | Types | Fields shown |
+| --- | --- | --- |
+| `DATE_RANGE` | Vacation / Time Off, Work From Home, Personal Time | Start date, End date (both required, no times) |
+| `SINGLE_DATE_TIME_RANGE` | Doctor Appointment, Schedule Change | one **Date** field, Start time, End time (all required) |
+| `NONE` | Expense / Purchase | no timing fields at all |
+| `OPTIONAL_RANGE` | Other Request | the original four independently-optional Start/End date/time fields — the flexible escape hatch for whatever doesn't fit a more specific shape |
+
+`expense: true` (Expense / Purchase only) additionally shows Amount and
+Currency fields; every other type has `expense: false` and never renders
+them.
+
+**Details and Approver are universal** — every type shows exactly one
+Details field (`resource` column, placeholder text adapted per type, e.g.
+"What's the occasion? (optional context)" for Vacation vs. "What are you
+purchasing?" for Expense) and exactly one Approver field, regardless of
+`timingMode`/`expense`.
+
+### `SINGLE_DATE_TIME_RANGE`: one date, never asked twice
+
+Doctor Appointment and Schedule Change show a single **Date** field (not
+"Start date") plus Start time and End time — asking a requester to pick
+the same date twice would be nonsensical. Server-side, this reuses the
+*existing* `validateRequestTiming()` unchanged: the single submitted date
+is used to construct `{ startDate: date, endDate: date, startTime,
+endTime }` before validation, which naturally satisfies the existing
+same-day strict `endTime > startTime` check with no new validation logic.
+Persistence always writes `requested_end_date = requested_start_date`; a
+client-crafted payload with a *different* end date is explicitly rejected
+server-side rather than silently trusted or silently overwritten.
+
+### Dynamic modal: `dispatch_action` + `views.update`, no new route
+
+Changing the Request Type dropdown must change which fields are visible
+*before* the requester submits, which Slack can only do by re-rendering
+the open modal. The Request Type `static_select`'s enclosing `input` block
+sets `dispatch_action: true`, so selecting a new type fires a normal
+signed `block_actions` interaction immediately (in addition to being
+captured at final `view_submission`, as usual) — handled in the *existing*
+`/api/slack/interactions` route by a new `handleRequestTypeChanged`
+branch; no new HTTP route was needed. That handler determines the newly
+selected type key, computes its `RequestTypeFieldConfig`, reads the
+modal's own echoed-back live field values (`payload.view.state.values`),
+best-effort maps them onto the new shape (see next section), rebuilds the
+view via `buildRequestModal(...)`, and pushes it back with
+`views.update({ view_id, hash })` — the same `view_id`/`hash` update
+mechanism M5/M7 already use to reflect a decision outcome in place. Slack
+returns `hash_conflict` if two updates race (e.g. very rapid repeated type
+switching); it's caught and logged, non-fatal, and simply skips that one
+stale update. The selected type is treated purely as UI state for
+rendering — it carries no authorization weight of its own, and the final
+submission is independently re-validated against whatever type was
+selected at submission time (see [Type-specific server
+validation](#type-specific-server-validation-is-not-optional) below).
+
+### Input preservation across a type change — best-effort, never fabricated
+
+Two pure, independently unit-tested functions
+(`remapTimingForModeChange`, `remapExpenseForModeChange` in
+`request-type-config.ts`) decide what carries over when the requester
+changes their mind about the type mid-fill:
+
+- Details and Approver are **always** preserved, regardless of type.
+- Switching between two `DATE_RANGE` types (e.g. Vacation → Work From
+  Home) keeps both dates.
+- Switching to `NONE` (Expense) drops all timing — an amount/currency
+  request has no use for dates.
+- Switching to `SINGLE_DATE_TIME_RANGE` keeps `startDate ?? endDate` as
+  the one remaining date plus both times, and drops the second date — it
+  is never fabricated from nothing.
+- Switching to `OPTIONAL_RANGE` (Other) preserves everything unchanged,
+  since it can represent anything the other shapes can.
+- Expense fields (Amount/Currency) are dropped entirely when switching
+  away from Expense / Purchase, and preserved when switching between
+  Expense and Expense (a no-op in practice, included for completeness).
+
+None of this preserved state has any authorization meaning — it is purely
+a UX convenience so the requester doesn't have to retype Details after
+exploring a couple of request types, and the **final** selected type at
+submission time is the only thing that determines which fields are
+accepted (see next section).
+
+### Type-specific server validation is not optional
+
+The modal only *hiding* a field is a UI convenience, not a security
+boundary — `validateRequestSubmission()` independently re-derives the
+final selected type's `RequestTypeFieldConfig` from the submitted payload
+and enforces its rules regardless of what the modal happened to render,
+rejecting a crafted payload that supplies fields inapplicable to that type
+(e.g. a `expense_purchase` submission carrying start/end dates, or a
+`vacation_time_off` submission carrying an amount) exactly as it rejects
+missing required fields. This mirrors the existing project posture that
+Slack UI state (which buttons/fields are visible) is never trusted as an
+authorization or validation boundary on its own — see [Type-specific
+server validation is CRITICAL] in the per-type rules table above and the
+extensive `validate-request-submission.test.ts` coverage for every type ×
+rule combination.
+
+### Expense / Purchase: amount and currency
+
+Expense / Purchase is the one type with no timing at all — it needs an
+amount and a currency instead, both new nullable columns
+(`requested_amount numeric(10,2)`, `requested_currency text`, migration
+`20260916020000_add_request_expense_fields.sql`). `numeric(10,2)` was
+chosen over `float`/`real` because money must never accumulate
+floating-point rounding error; the app-layer regex in
+`validateExpense()` (`src/lib/requests/expense.ts`) — not the column's
+typmod — is the layer that actually *rejects* more-than-2-decimal-place
+input (Postgres's own `numeric(10,2)` would otherwise silently *round* a
+value like `499.999` to `500.00` rather than error, which would silently
+misrepresent what the requester typed). Currency is a small fixed
+ISO-4217-style allow-list — `USD, EUR, GBP, MKD, CAD, AUD` — enforced both
+in `SUPPORTED_CURRENCIES` (app code) and a matching DB CHECK constraint;
+there is deliberately no FX conversion, no currency-rate API, and no
+localization engine anywhere in this design. Adding a 7th currency later
+is a small follow-up migration plus a one-line array update, an accepted
+MVP tradeoff.
+
+**Why "Expense / Purchase requires an amount" is not a DB constraint:**
+`amount > 0` and `currency IN (...)` are simple, row-level checks that
+only ever look at the row being inserted — exactly the shape a Postgres
+CHECK constraint is good at, and both are immediately valid today because
+the columns are brand-new (every existing row is `NULL` in both,
+trivially satisfying an `IS NULL OR ...` check). A rule like "a row whose
+`request_type_id` resolves to `expense_purchase` must have a non-null
+amount," by contrast, needs to know something about the *related*
+`request_types` row — either denormalizing `request_types.key` onto
+`requests` or adding a trigger, both more machinery than a single-request
+MVP invariant justifies. That rule is deliberately kept authoritative in
+one place instead: `getRequestTypeFieldConfig()` +
+`validate-request-submission.ts`. No triggers were added for M8.
+
+### Rendering: amount and timing are mutually exclusive, by construction
+
+Every renderer (Request Details, the approver DM, the requester
+notification, App Home/Request Center row summaries) checks both
+`formatWhenLabel(...)` and the new `formatAmountLabel(amount, currency)`
+(`src/lib/requests/expense.ts`) and renders whichever is non-null — never
+both, and never a `+` sign or hard runtime assertion enforcing that,
+because the type-specific validator already guarantees only one half is
+ever populated for any given request. `formatAmountLabel` renders
+`"EUR 499.99"`-style (currency code, space, exactly two decimals) and
+returns `null` if either half is missing, matching every other formatter
+in this codebase's "never render a partial value" convention. Row
+summaries show, e.g., "Vacation / Time Off — Family trip / Sep 21 – Sep
+25" or "Expense / Purchase — External monitor / EUR 499.99".
+
+### Request modal: field layout by type
+
+**Every type:** Request Type → Details → *(type-specific fields)* →
+Approver, organized into visually distinct REQUEST / WHEN / EXPENSE /
+APPROVAL groups using Block Kit `context` section labels (bold mrkdwn,
+never a fake disabled input standing in as a heading) and dividers:
+
+| Type | Fields between Details and Approver |
+| --- | --- |
+| Vacation / Time Off, Work From Home, Personal Time | Start date, End date |
+| Doctor Appointment, Schedule Change | Date, Start time, End time |
+| Expense / Purchase | Amount, Currency |
+| Other Request | Start date, Start time, End date, End time (all optional) |
+
+Before any type is selected, the modal shows only Request Type, Details,
+and Approver — no WHEN/EXPENSE section renders until there's a type to
+determine one. The native Slack `users_select` approver picker is
+unchanged and still required — M8 doesn't touch approver selection,
+org-chart lookup, or manager directories at all, and its former hint text
+explaining policy-vs-manual routing (an internal implementation detail)
+was removed — ordinary employees don't need to know or think about it.
+DIRECT routing (the requester's selected approver) remains the
+zero-config default; if an active POLICY exists for the selected request
+type, M4's routing precedence is completely unchanged — POLICY still
+overrides the manually selected approver, exactly as it always has. None
+of the 7 new default types has a policy configured anywhere, so all of
+them route DIRECT out of the box; policies remain available as an
+explicit, optional, script-configured capability (see [Approval policy
 configuration](#approval-policy-configuration-optional-m3) above) for
 whoever wants that on top.
 
@@ -1709,6 +1913,22 @@ newer (and quickly discarded) option list, which would have silently
 misrepresented that request's own history. That request correctly shows
 "4 hours" again.
 
+`formatWhenLabel()` is a *rendering* function, entirely independent of the
+type-aware validation added afterward — it renders whatever combination of
+date/time fields a request actually has, regardless of which request type
+it belongs to or which modal shape was in effect when it was created. This
+matters for the handful of real requests created during the brief window
+when the Create Request modal still showed the original universal
+four-field shape (before it became type-aware): those rows can have, for
+example, a `vacation_time_off` request with only a start time and no
+dates, a combination the *new* type-aware submission validator would now
+reject for that type. That's fine and expected — the type-aware rules
+introduced in this milestone apply only to *new* submissions going
+forward; they are never retroactively enforced against, or used to
+reject the rendering of, already-created rows. Those requests keep
+rendering through the same `formatWhenLabel()`/`formatAmountLabel()` path
+as everything else, exactly as entered.
+
 ### An incidental bug found and fixed while adding modal tests
 
 `build-request-modal.ts` had never had a unit test file before M8 (no prior
@@ -1724,55 +1944,84 @@ fix — zero behavior change, confirmed by an unchanged build output.
 
 ## M8 end-to-end testing procedure (prepared, not yet executed — pending migration review)
 
-Needs all three M8 migrations reviewed and pushed
-(`pnpm dlx supabase db push`, not run by me).
+Needs all four M8 migrations reviewed and pushed
+(`pnpm dlx supabase db push`, not run by me), including the not-yet-pushed
+`20260916020000_add_request_expense_fields.sql`.
 
 ### Test A — existing workspace upgrade: date range (Vacation / Time Off)
 
 1. Open App Home → **Create Request**. On first open, Request Type must
-   show exactly the 7 new workplace types — none of the 5 legacy ones.
-   Confirm the field order: Request Type, Details, Start date, Start time,
-   End date, End time, Approver — no Resource, no Reason, no duration
-   dropdown, no policy-routing hint under Approver.
-2. Type: "Vacation / Time Off", Details: "M8 Vacation Test", Start date: a
-   future date, Start time: left blank, End date: a few days later, End
-   time: left blank, Approver: the other test account. Submit.
-3. Verify the approver's DM shows `Details: M8 Vacation Test` and
-   `When: <start date>, 2026 – <end date>, 2026` (no times, since none were
-   given), and routes DIRECT.
-4. Approver approves with "Approved for M8 E2E". Verify: request APPROVED,
+   show exactly the 7 new workplace types — none of the 5 legacy ones —
+   and the modal must show only Request Type, Details, and Approver; no
+   WHEN or EXPENSE section renders until a type is picked.
+2. Select "Vacation / Time Off" — confirm the modal immediately re-renders
+   in place (`views.update`) to add Start date and End date (both marked
+   required, no times, no Amount/Currency).
+3. Details: "M8 Vacation Test", Start date: a future date, End date: a few
+   days later, Approver: the other test account. Submit.
+4. Verify the approver's DM shows `Details: M8 Vacation Test` and
+   `When: <start date>, 2026 – <end date>, 2026`, and routes DIRECT.
+5. Approver approves with "Approved for M8 E2E". Verify: request APPROVED,
    Request Details shows the correct date range, the requester notification
    shows the same range and the M7 comment, and no "Duration" terminology
    appears anywhere for this new request.
 
-### Test B — Doctor Appointment with times, same day
+### Test B — Doctor Appointment: one date, two times, same day
 
-1. Create "Doctor Appointment", Details: "M8 Dentist Test", Start
-   date/time: one future date / "10:00", End date: the same date, End
-   time: "12:00", Approver: the other account. Submit.
-2. Verify `When: <date>, 2026, 10:00 – 12:00` renders identically in
+1. Create Request → select "Doctor Appointment" — confirm the modal
+   re-renders to show exactly one **Date** field (not "Start date") plus
+   Start time and End time — no End date field at all.
+2. Details: "M8 Dentist Test", Date: one future date, Start time: "10:00",
+   End time: "12:00", Approver: the other account. Submit.
+3. Verify `When: <date>, 2026, 10:00 – 12:00` renders identically in
    Request Details, the approver's view, and the requester's final
-   notification once decided.
+   notification once decided. Confirm in Supabase that
+   `requested_end_date` was persisted equal to `requested_start_date`, not
+   null and not a different date.
 
-### Test C — no timing at all (Expense / Purchase)
+### Test C — Expense / Purchase: amount and currency, no timing at all
 
-1. Create "Expense / Purchase", Details: "M8 Monitor Test", leave all four
-   timing fields blank, Approver: the other account. Submit.
-2. Verify: succeeds, no "When" field appears anywhere, never "Not
-   specified"/"0 minutes"/a malformed value. Safe to leave PENDING.
+1. Create Request → select "Expense / Purchase" — confirm the modal
+   re-renders to show Amount and Currency fields, and no timing fields of
+   any kind.
+2. Details: "M8 Monitor Test", Amount: "499.99", Currency: "EUR",
+   Approver: the other account. Submit.
+3. Verify: succeeds, `Amount: EUR 499.99` renders in Request Details, the
+   approver DM, and the requester notification — no "When" field appears
+   anywhere for this request. Safe to leave PENDING.
 
-### Test D — validation
+### Test D — dynamic modal: input preservation across a type change
 
-1. Open another Create Request. Enter a start date, then an *earlier* end
-   date. Submit → Slack must block submission with a clear field error, no
-   request created.
-2. Same start/end date, start time "10:00", end time "09:00". Submit →
-   must be rejected with a clear field error (end time must be after start
-   time). Confirm a same-day request with only one of the two times filled
-   in is **not** rejected — only a fully-specified, wrongly-ordered pair is
-   invalid.
+1. Create Request → select "Vacation / Time Off", fill Details, Start
+   date, End date, and Approver. Without submitting, change the Request
+   Type to "Work From Home" — confirm Details, Start date, End date, and
+   Approver are all still filled in (both are `DATE_RANGE`, fully
+   compatible).
+2. Now change the Request Type to "Expense / Purchase" — confirm Details
+   and Approver are still filled in, but the dates are gone (dropped, not
+   carried into hidden state) and Amount/Currency are empty (never
+   pre-filled from the dates).
+3. Fill Amount/Currency, then switch to "Other Request" — confirm
+   Details/Approver persist and Amount/Currency are dropped; Other Request
+   shows the full four optional timing fields, all empty.
 
-### Test E — historical compatibility
+### Test E — validation (per type, crafted-payload resistant)
+
+1. Vacation / Time Off: enter a start date and an *earlier* end date.
+   Submit → blocked with a clear field error, no request created.
+2. Doctor Appointment: enter Date, start time "10:00", end time "09:00".
+   Submit → rejected (end time must be strictly after start time on the
+   same day).
+3. Expense / Purchase: enter amount "499.999" (3 decimals). Submit →
+   rejected, never silently rounded to "500.00" or "499.99". Also try
+   amount "0" and a blank currency — both rejected.
+4. Confirm a same-day Doctor Appointment/Schedule Change request with only
+   one of Start time/End time filled in is **not** rejected by the
+   underlying timing check — only a fully-specified, wrongly-ordered pair
+   is invalid (this rule is inherited unchanged from the prior timing
+   correction, still exercised via the `SINGLE_DATE_TIME_RANGE` path).
+
+### Test F — historical compatibility
 
 1. Open an old historical Production Access request → still opens, still
    says "Production Access", its original Reason still renders, its
@@ -1782,6 +2031,12 @@ Needs all three M8 migrations reviewed and pushed
 3. Confirm the "Production Access Approval" policy is still `active = true`
    with its members unchanged — simply unreachable from new request
    creation.
+4. Open any request created during the brief window when the modal still
+   showed the old universal four-field shape (before this milestone) —
+   it must still render exactly as entered (e.g. a `vacation_time_off`
+   request with only a time and no dates, if one exists), never blocked
+   or altered by the new type-aware rules, which apply only to new
+   submissions.
 
 ### Fresh-workspace zero-config journey (separate — after the above)
 
@@ -1831,11 +2086,15 @@ src/
       duration-options.test.ts
       request-timing.ts           # pure (M8 correction): start/end date+time validation + the one shared "When" formatter (unit tested)
       request-timing.test.ts
+      request-type-config.ts      # pure (M8 field-matrix correction): centralized per-type field config (TimingMode/expense) + input-preservation remap functions (unit tested)
+      request-type-config.test.ts
+      expense.ts                  # pure (M8 field-matrix correction): amount/currency validation + the shared "Amount" formatter (unit tested)
+      expense.test.ts
       request-types.ts            # server-only: default request types + idempotent seeding (M8: 7 workplace types replace the original 5)
       workspace-lookup.ts         # server-only: workspace/user lookup+upsert
-      build-request-modal.ts      # pure: Block Kit modal builder — Request Type / Details / Start+End date+time / Approver (M8 correction; unit tested)
+      build-request-modal.ts      # pure: request-type-aware Block Kit modal builder, dynamically shaped per TimingMode/expense (M8 field-matrix correction; unit tested)
       build-request-modal.test.ts
-      validate-request-submission.ts  # pure: view_submission validation (unit tested; M8: no separate Reason field; M8 correction: date/time fields, not a duration dropdown)
+      validate-request-submission.ts  # pure: view_submission validation, type-specific per REQUEST_TYPE_FIELD_CONFIG (unit tested; M8 field-matrix correction)
       validate-request-submission.test.ts
       build-approval-notification.ts  # pure: approver DM builder, message update, outcome text (M8: Details terminology, optional Reason; M8 correction: When timing)
       parse-block-action.ts       # pure: block_actions (Approve/Reject) validation — message- and modal-origin (unit tested; M7: now also requires trigger_id)

@@ -18,6 +18,17 @@ const sampleRequest: RequestSummary = {
   resource: "AWS Test Resource",
   status: "PENDING",
   whenText: "2 hours",
+  amountText: null,
+  createdAt: "2026-09-15T20:00:00.000Z",
+};
+
+const sampleExpenseRequest: RequestSummary = {
+  id: "req-2",
+  requestTypeName: "Expense / Purchase",
+  resource: "External monitor",
+  status: "PENDING",
+  whenText: null,
+  amountText: "EUR 499.99",
   createdAt: "2026-09-15T20:00:00.000Z",
 };
 
@@ -53,6 +64,13 @@ test("each request row includes request type, resource, status, duration, and a 
   assert.ok(text.includes("req-1"));
 });
 
+test("an expense row shows the amount/currency instead of a When line", () => {
+  const view = buildRequestCenterView({ myRequests: [sampleExpenseRequest], myRequestsTotalCount: 1, waitingCount: 0 });
+  const text = blocksToText(view);
+  assert.ok(text.includes("EUR 499.99"));
+  assert.ok(text.includes("External monitor"));
+});
+
 test("waiting count is surfaced with a button when non-zero", () => {
   const view = buildRequestCenterView({ myRequests: [], myRequestsTotalCount: 0, waitingCount: 3 });
   const text = blocksToText(view);
@@ -80,6 +98,7 @@ const baseDetails: RequestDetailsView = {
   resource: "AWS Test Resource",
   reason: "Need it for testing",
   when: { label: "When / Duration", value: "2 hours" },
+  amountLabel: null,
   status: "PENDING",
   createdAt: "2026-09-15T20:00:00.000Z",
   requesterSlackUserId: "U0REQUESTER",
@@ -233,6 +252,15 @@ test("a request with no timing at all shows no When field — no placeholder", (
   const text = blocksToText(buildRequestDetailsView({ details: { ...baseDetails, reason: null, when: null } }));
   assert.ok(!text.includes("*When"));
   assert.ok(!text.includes("Not specified"));
+});
+
+test("an Expense / Purchase request shows an Amount field instead of When", () => {
+  const text = blocksToText(
+    buildRequestDetailsView({ details: { ...baseDetails, reason: null, when: null, amountLabel: "EUR 499.99" } }),
+  );
+  assert.ok(text.includes("*Amount:*"));
+  assert.ok(text.includes("EUR 499.99"));
+  assert.ok(!text.includes("*When"));
 });
 
 test("a pre-M8 historical request with a reason still shows a Reason field", () => {

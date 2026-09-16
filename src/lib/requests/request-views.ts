@@ -1,13 +1,14 @@
 import "server-only";
 
 import type { RequestDetailsView, RequestSummary } from "@/lib/requests/build-requests-views";
+import { formatAmountLabel } from "@/lib/requests/expense";
 import { formatWhenLabel, type RequestTiming } from "@/lib/requests/request-timing";
 import { getSupabaseAdmin } from "@/lib/supabase/admin";
 
 const MY_REQUESTS_LIMIT = 10;
 
 const REQUEST_SUMMARY_COLUMNS =
-  "id, resource, status, requested_duration_minutes, requested_start_date, requested_start_time, requested_end_date, requested_end_time, created_at, request_types(name)";
+  "id, resource, status, requested_duration_minutes, requested_start_date, requested_start_time, requested_end_date, requested_end_time, requested_amount, requested_currency, created_at, request_types(name)";
 
 interface RequestSummaryRow {
   id: string;
@@ -18,6 +19,8 @@ interface RequestSummaryRow {
   requested_start_time: string | null;
   requested_end_date: string | null;
   requested_end_time: string | null;
+  requested_amount: number | null;
+  requested_currency: string | null;
   created_at: string;
   request_types: { name: string } | { name: string }[] | null;
 }
@@ -36,6 +39,7 @@ function toSummary(row: RequestSummaryRow): RequestSummary {
     resource: row.resource,
     status: row.status,
     whenText: formatWhenLabel(timing, row.requested_duration_minutes)?.value ?? null,
+    amountText: formatAmountLabel(row.requested_amount, row.requested_currency),
     createdAt: row.created_at,
   };
 }
@@ -166,7 +170,7 @@ export async function getRequestDetails(workspaceId: string, requestId: string, 
   const { data: request, error: requestError } = await supabase
     .from("requests")
     .select(
-      "id, resource, reason, status, requested_duration_minutes, requested_start_date, requested_start_time, requested_end_date, requested_end_time, created_at, requester_id, routing_type, approval_policy_id, direct_approver_id, request_types(name), users!requests_requester_id_fkey(slack_user_id)",
+      "id, resource, reason, status, requested_duration_minutes, requested_start_date, requested_start_time, requested_end_date, requested_end_time, requested_amount, requested_currency, created_at, requester_id, routing_type, approval_policy_id, direct_approver_id, request_types(name), users!requests_requester_id_fkey(slack_user_id)",
     )
     .eq("id", requestId)
     .eq("workspace_id", workspaceId)
@@ -258,6 +262,7 @@ export async function getRequestDetails(workspaceId: string, requestId: string, 
     resource: request.resource,
     reason: request.reason,
     when: formatWhenLabel(timing, request.requested_duration_minutes),
+    amountLabel: formatAmountLabel(request.requested_amount, request.requested_currency),
     status: request.status,
     createdAt: request.created_at,
     requesterSlackUserId: requester?.slack_user_id ?? "unknown",

@@ -1,3 +1,4 @@
+import { formatAmountLabel, type RequestExpense } from "./expense.ts";
 import { formatWhenLabel, type RequestTiming } from "./request-timing.ts";
 
 export type DecisionOutcome =
@@ -37,6 +38,8 @@ export interface BuildRequesterDecisionNotificationParams {
   timing: RequestTiming;
   /** Non-null only for pre-M8-correction historical requests — see request-timing.ts's formatWhenLabel. */
   legacyDurationMinutes: number | null;
+  /** M8 type-aware correction: set only for expense-mode request types — mutually exclusive with `timing` by construction. */
+  expense: RequestExpense;
   routingType: "POLICY" | "DIRECT";
   /** The Slack user whose click caused this transition. */
   decidingApproverSlackId: string;
@@ -57,6 +60,7 @@ export function buildRequesterDecisionNotification({
   resource,
   timing,
   legacyDurationMinutes,
+  expense,
   routingType,
   decidingApproverSlackId,
   comment,
@@ -79,6 +83,10 @@ export function buildRequesterDecisionNotification({
   const when = formatWhenLabel(timing, legacyDurationMinutes);
   if (when) {
     fields.push({ type: "mrkdwn", text: `*${when.label}:*\n${when.value}` });
+  }
+  const amountLabel = formatAmountLabel(expense.amount, expense.currency);
+  if (amountLabel) {
+    fields.push({ type: "mrkdwn", text: `*Amount:*\n${amountLabel}` });
   }
   fields.push({ type: "mrkdwn", text: `*Status:*\n${decision}` });
   if (showDecidingApprover) {

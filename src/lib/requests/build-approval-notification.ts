@@ -1,3 +1,4 @@
+import { formatAmountLabel, type RequestExpense } from "./expense.ts";
 import { formatWhenLabel, type RequestTiming } from "./request-timing.ts";
 import type { DecideOnRequestResult } from "../../types/approval.ts";
 
@@ -33,10 +34,12 @@ export interface BuildApprovalNotificationParams {
   resource: string;
   /** M8: null for every new request (merged into Details) — non-null only for pre-M8 historical requests, which still show it. */
   reason: string | null;
-  /** M8 correction: replaces the fixed duration dropdown for new requests — see request-timing.ts. */
+  /** M8 correction: replaces the fixed duration dropdown for new requests — see request-timing.ts. Only ever set together with `timingMode !== "NONE"` for the selected type — see request-type-config.ts. */
   timing: RequestTiming;
   /** Non-null only for pre-M8-correction historical requests — see request-timing.ts's formatWhenLabel. */
   legacyDurationMinutes: number | null;
+  /** M8 type-aware correction: set only for expense-mode request types (Expense / Purchase) — mutually exclusive with `timing` by construction of validate-request-submission.ts's type-specific validation. */
+  expense: RequestExpense;
 }
 
 /** The initial DM sent to each policy member when a request is created. Includes the Approve/Reject buttons. */
@@ -48,6 +51,7 @@ export function buildApprovalNotification({
   reason,
   timing,
   legacyDurationMinutes,
+  expense,
 }: BuildApprovalNotificationParams): ApprovalMessageContent {
   const requesterMention = formatUserMention(requester);
   const buttonValue = JSON.stringify({ requestId });
@@ -62,6 +66,10 @@ export function buildApprovalNotification({
   const when = formatWhenLabel(timing, legacyDurationMinutes);
   if (when) {
     fields.push({ type: "mrkdwn", text: `*${when.label}:*\n${when.value}` });
+  }
+  const amountLabel = formatAmountLabel(expense.amount, expense.currency);
+  if (amountLabel) {
+    fields.push({ type: "mrkdwn", text: `*Amount:*\n${amountLabel}` });
   }
 
   return {

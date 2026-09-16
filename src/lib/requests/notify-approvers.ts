@@ -3,6 +3,7 @@ import "server-only";
 import { WebClient } from "@slack/web-api";
 
 import { buildApprovalNotification } from "@/lib/requests/build-approval-notification";
+import type { RequestExpense } from "@/lib/requests/expense";
 import type { RequestTiming } from "@/lib/requests/request-timing";
 import { decryptBotToken } from "@/lib/slack/token-encryption";
 import type { Workspace } from "@/types/workspace";
@@ -19,6 +20,7 @@ export interface NotifyApproversParams {
   resource: string;
   reason: string | null;
   timing: RequestTiming;
+  expense: RequestExpense;
   requester: { slack_user_id: string; display_name: string | null };
   /**
    * Precomputed by the caller (the interactions route): the policy's
@@ -50,6 +52,7 @@ export async function notifyApprovers({
   resource,
   reason,
   timing,
+  expense,
   requester,
   recipients,
 }: NotifyApproversParams): Promise<void> {
@@ -77,6 +80,7 @@ export async function notifyApprovers({
     resource,
     reason,
     timing,
+    expense,
     // Always null here — this function only ever fires for a request just
     // created in this same request cycle (see the interactions route),
     // which by construction has no legacy duration. The historical fallback

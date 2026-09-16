@@ -1,4 +1,13 @@
 import {
+  EXPENSE_AMOUNT_ACTION_ID,
+  EXPENSE_AMOUNT_BLOCK_ID,
+  EXPENSE_CURRENCY_ACTION_ID,
+  EXPENSE_CURRENCY_BLOCK_ID,
+  validateExpense,
+  type RequestExpense,
+} from "./expense.ts";
+import { getRequestTypeFieldConfig } from "./request-type-config.ts";
+import {
   END_DATE_ACTION_ID,
   END_DATE_BLOCK_ID,
   END_TIME_ACTION_ID,
@@ -49,8 +58,10 @@ export interface ValidatedRequestSubmission {
   requestTypeKey: string;
   /** M8: "Details" in the UI — free-text description of the request. Stored in the `resource` column (unrenamed; see build-request-modal.ts). */
   resource: string;
-  /** M8 correction: replaces the fixed duration dropdown — see request-timing.ts. */
+  /** M8 correction: replaces the fixed duration dropdown — see request-timing.ts. Every field NULL unless the selected type's config actually collects timing (see request-type-config.ts). */
   timing: RequestTiming;
+  /** Non-null only when the selected type's config marks it expense-bearing. */
+  expense: RequestExpense;
   /** The Slack user ID selected via the modal's native picker — an identifier only, not an authorization claim. See the interactions route for how it's actually used (or discarded) depending on routing. */
   selectedApproverSlackId: string;
 }
@@ -75,20 +86,23 @@ function getOptionalFieldValue(payload: ViewSubmissionPayload, blockId: string, 
   return getFieldValue(payload, blockId, actionId) ?? null;
 }
 
+const NO_TIMING: RequestTiming = { startDate: null, startTime: null, endDate: null, endTime: null };
+
 /**
  * Validates a view_submission payload structurally and against business
  * rules. Does NOT touch the database — `validRequestTypeKeys` is passed in
  * by the caller (resolved fresh from the workspace's own request_types
  * rows), so this stays pure and unit-testable.
  *
- * M8: no longer collects a separate "Reason" — merged into "Details"
- * (resource_block). The database's `reason` column is nullable and simply
- * left unpopulated for new submissions (see the interactions route); no
- * fabricated/duplicated content is written to it. The fixed duration
- * dropdown is gone entirely — timing is validated via
- * request-timing.ts's validateRequestTiming, whose per-field errors are
- * merged in directly (its block IDs are its own dedicated blocks, so there
- * is no collision with any error key here).
+ * M8 correction: which timing/expense fields are required, optional, or
+ * outright rejected-if-present is entirely driven by
+ * `getRequestTypeFieldConfig(requestTypeKey)` — the same shared config
+ * build-request-modal.ts and the interactions route's dynamic-modal
+ * handler read. Nothing here special-cases a request type by string
+ * comparison outside that one lookup. Never trusts the modal to have hidden
+ * an inapplicable field — a crafted/malformed submission carrying a field
+ * that doesn't belong to the selected type's mode is rejected exactly like
+ * a missing required one, not silently accepted or ignored.
  */
 export function validateRequestSubmission(
   payload: ViewSubmissionPayload,
@@ -116,7 +130,8 @@ export function validateRequestSubmission(
   }
 
   const requestTypeKey = getFieldValue(payload, "request_type_block", "request_type_select");
-  if (!requestTypeKey || !validRequestTypeKeys.includes(requestTypeKey)) {
+  const isKnownType = Boolean(requestTypeKey) && validRequestTypeKeys.includes(requestTypeKey as string);
+  if (!isKnownType) {
     errors.request_type_block = "Please select a valid request type.";
   }
 
@@ -127,16 +142,97 @@ export function validateRequestSubmission(
     errors.resource_block = `Details must be ${MAX_DETAILS_LENGTH} characters or fewer.`;
   }
 
-  const timing: RequestTiming = {
+  const rawTiming: RequestTiming = {
     startDate: getOptionalFieldValue(payload, START_DATE_BLOCK_ID, START_DATE_ACTION_ID),
     startTime: getOptionalFieldValue(payload, START_TIME_BLOCK_ID, START_TIME_ACTION_ID),
     endDate: getOptionalFieldValue(payload, END_DATE_BLOCK_ID, END_DATE_ACTION_ID),
     endTime: getOptionalFieldValue(payload, END_TIME_BLOCK_ID, END_TIME_ACTION_ID),
   };
-  const timingResult = validateRequestTiming(timing);
-  if (!timingResult.ok) {
-    Object.assign(errors, timingResult.errors);
+  const rawExpenseInput = {
+    amount: getOptionalFieldValue(payload, EXPENSE_AMOUNT_BLOCK_ID, EXPENSE_AMOUNT_ACTION_ID),
+    currency: getOptionalFieldValue(payload, EXPENSE_CURRENCY_BLOCK_ID, EXPENSE_CURRENCY_ACTION_ID),
+  };
+
+  let timing: RequestTiming = NO_TIMING;
+  let expense: RequestExpense = { amount: null, currency: null };
+
+  if (isKnownType) {
+    const config = getRequestTypeFieldConfig(requestTypeKey as string);
+
+    // --- Expense: required together only for an expense-mode type; rejected outright (never silently ignored) for every other type. ---
+    if (config.expense) {
+      const expenseResult = validateExpense(rawExpenseInput);
+      if (!expenseResult.ok) {
+        Object.assign(errors, expenseResult.errors);
+      } else {
+        expense = expenseResult.data;
+      }
+    } else if (rawExpenseInput.amount !== null || rawExpenseInput.currency !== null) {
+      errors[EXPENSE_AMOUNT_BLOCK_ID] = "Amount/currency don't apply to this request type.";
+    }
+
+    // --- Timing: shape depends entirely on the type's configured mode. ---
+    if (config.timingMode === "NONE") {
+      if (rawTiming.startDate || rawTiming.startTime || rawTiming.endDate || rawTiming.endTime) {
+        errors[START_DATE_BLOCK_ID] = "Timing doesn't apply to this request type.";
+      }
+    } else if (config.timingMode === "DATE_RANGE") {
+      if (rawTiming.startTime !== null) {
+        errors[START_TIME_BLOCK_ID] = "A specific time doesn't apply to this request type.";
+      }
+      if (rawTiming.endTime !== null) {
+        errors[END_TIME_BLOCK_ID] = "A specific time doesn't apply to this request type.";
+      }
+      if (!rawTiming.startDate) {
+        errors[START_DATE_BLOCK_ID] = "Start date is required.";
+      }
+      if (!rawTiming.endDate) {
+        errors[END_DATE_BLOCK_ID] = "End date is required.";
+      }
+      timing = { startDate: rawTiming.startDate, startTime: null, endDate: rawTiming.endDate, endTime: null };
+      if (rawTiming.startDate && rawTiming.endDate && !errors[START_TIME_BLOCK_ID] && !errors[END_TIME_BLOCK_ID]) {
+        const timingResult = validateRequestTiming(timing);
+        if (!timingResult.ok) {
+          Object.assign(errors, timingResult.errors);
+        }
+      }
+    } else if (config.timingMode === "SINGLE_DATE_TIME_RANGE") {
+      // Conceptually one date, never a range: the employee picks it once
+      // (block_id START_DATE_BLOCK_ID, labeled "Date" — see
+      // build-request-modal.ts) and it's persisted as BOTH
+      // requested_start_date and requested_end_date. A distinct end date
+      // is never even rendered for this mode; if one is somehow present in
+      // a crafted submission and disagrees with the single date, reject it
+      // outright rather than silently using either value.
+      if (rawTiming.endDate !== null && rawTiming.endDate !== rawTiming.startDate) {
+        errors[END_DATE_BLOCK_ID] = "A separate end date doesn't apply to this request type.";
+      }
+      if (!rawTiming.startDate) {
+        errors[START_DATE_BLOCK_ID] = "Date is required.";
+      }
+      if (!rawTiming.startTime) {
+        errors[START_TIME_BLOCK_ID] = "Start time is required.";
+      }
+      if (!rawTiming.endTime) {
+        errors[END_TIME_BLOCK_ID] = "End time is required.";
+      }
+      timing = { startDate: rawTiming.startDate, startTime: rawTiming.startTime, endDate: rawTiming.startDate, endTime: rawTiming.endTime };
+      if (rawTiming.startDate && rawTiming.startTime && rawTiming.endTime && !errors[END_DATE_BLOCK_ID]) {
+        const timingResult = validateRequestTiming(timing);
+        if (!timingResult.ok) {
+          Object.assign(errors, timingResult.errors);
+        }
+      }
+    } else {
+      // OPTIONAL_RANGE ("Other Request") — the full, independently-optional shape, unchanged from the general-purpose validator.
+      const timingResult = validateRequestTiming(rawTiming);
+      if (!timingResult.ok) {
+        Object.assign(errors, timingResult.errors);
+      }
+      timing = rawTiming;
+    }
   }
+  // An unknown/invalid request type already fails via request_type_block above — timing/expense are left at their null defaults rather than guessing a mode for a type we couldn't resolve.
 
   // Required even though a POLICY-routed submission will end up ignoring
   // it server-side — the modal can't know client-side whether a policy
@@ -161,6 +257,7 @@ export function validateRequestSubmission(
       requestTypeKey: requestTypeKey as string,
       resource,
       timing,
+      expense,
       selectedApproverSlackId: selectedApproverSlackId as string,
     },
   };

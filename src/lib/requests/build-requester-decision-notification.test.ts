@@ -13,6 +13,7 @@ function fieldTexts(content: ReturnType<typeof buildRequesterDecisionNotificatio
 }
 
 const NO_TIMING: RequestTiming = { startDate: null, startTime: null, endDate: null, endTime: null };
+const NO_EXPENSE = { amount: null, currency: null };
 
 const baseParams = {
   decision: "APPROVED" as const,
@@ -23,6 +24,7 @@ const baseParams = {
   // original scale) — exercises the legacy fallback path in every test that
   // doesn't override it with real timing.
   legacyDurationMinutes: 120,
+  expense: NO_EXPENSE,
   routingType: "DIRECT" as const,
   decidingApproverSlackId: "U0APPROVER1",
   comment: null,
@@ -107,6 +109,18 @@ test("a request with real M8 timing shows a 'When' field, not 'When / Duration'"
 test("a request with no timing and no legacy duration shows no When field at all", () => {
   const content = buildRequesterDecisionNotification({ ...baseParams, timing: NO_TIMING, legacyDurationMinutes: null });
   const texts = fieldTexts(content);
+  assert.ok(!texts.some((t) => t.includes("When")));
+});
+
+test("an Expense / Purchase request shows an Amount field instead of When", () => {
+  const content = buildRequesterDecisionNotification({
+    ...baseParams,
+    timing: NO_TIMING,
+    legacyDurationMinutes: null,
+    expense: { amount: 499.99, currency: "EUR" },
+  });
+  const texts = fieldTexts(content);
+  assert.ok(texts.some((t) => t.includes("*Amount:*") && t.includes("EUR 499.99")));
   assert.ok(!texts.some((t) => t.includes("When")));
 });
 
