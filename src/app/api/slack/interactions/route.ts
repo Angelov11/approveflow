@@ -1,9 +1,11 @@
 import { randomUUID } from "node:crypto";
 
 import { WebClient } from "@slack/web-api";
+import { after } from "next/server";
 import type { NextRequest } from "next/server";
 
 import { serverEnv } from "@/lib/env.server";
+import { createRequestTimer, type RequestTimer } from "@/lib/observability/timing";
 import { decideOnRequest } from "@/lib/requests/approval-actions";
 import { findActivePolicyForRequestType, listPolicyRecipients } from "@/lib/requests/approval-policies";
 import { buildApprovalNotification, describeDecisionOutcome, replaceActionsWithStatus, APPROVE_ACTION_ID, REJECT_ACTION_ID } from "@/lib/requests/build-approval-notification";
@@ -44,7 +46,7 @@ import {
 } from "@/lib/requests/request-timing";
 import { validateDecisionSubmission, type DecisionSubmissionPayload } from "@/lib/requests/validate-decision-submission";
 import { validateRequestSubmission, type ViewSubmissionPayload } from "@/lib/requests/validate-request-submission";
-import { findWorkspaceBySlackTeamId, upsertSlackUser } from "@/lib/requests/workspace-lookup";
+import { findWorkspaceBySlackTeamId, getUsableInstallation, upsertSlackUser } from "@/lib/requests/workspace-lookup";
 import { decryptBotToken } from "@/lib/slack/token-encryption";
 import { isValidSlackRequest } from "@/lib/slack/verify-request";
 import { getSupabaseAdmin } from "@/lib/supabase/admin";
@@ -63,7 +65,19 @@ function modalUpdate(view: ModalView) {
 
 const ack = () => new Response(null, { status: 200 });
 
+/** Best-effort label for the ack summary line — never affects dispatch, only observability. */
+function describeFlow(payload: { type?: string; actions?: { action_id?: string }[]; view?: { callback_id?: string } }): string {
+  if (payload.type === "block_actions") {
+    return payload.actions?.[0]?.action_id ?? "block_actions_unrecognized";
+  }
+  if (payload.type === "view_submission") {
+    return payload.view?.callback_id ?? "view_submission_unrecognized";
+  }
+  return payload.type ?? "unrecognized";
+}
+
 export async function POST(request: NextRequest) {
+  const verifyStart = performance.now();
   const rawBody = await request.text();
 
   const isValid = isValidSlackRequest({
@@ -72,10 +86,12 @@ export async function POST(request: NextRequest) {
     timestamp: request.headers.get("x-slack-request-timestamp"),
     signature: request.headers.get("x-slack-signature"),
   });
+  const verifyMs = performance.now() - verifyStart;
   if (!isValid) {
     return new Response("Unauthorized", { status: 401 });
   }
 
+  const parseStart = performance.now();
   const form = new URLSearchParams(rawBody);
   const rawPayload = form.get("payload");
   if (!rawPayload) {
@@ -88,11 +104,16 @@ export async function POST(request: NextRequest) {
   } catch {
     return ack();
   }
+  const parseMs = performance.now() - parseStart;
+
+  const timer = createRequestTimer("interactions", describeFlow(payload));
+  timer.markVerify(verifyMs);
+  timer.markParse(parseMs);
 
   if (payload.type === "block_actions") {
     const actionId = payload.actions?.[0]?.action_id;
     if (actionId === APPROVE_ACTION_ID || actionId === REJECT_ACTION_ID) {
-      return handleOpenDecisionModal(payload as BlockActionsPayload, actionId === APPROVE_ACTION_ID ? "APPROVED" : "REJECTED");
+      return handleOpenDecisionModal(payload as BlockActionsPayload, actionId === APPROVE_ACTION_ID ? "APPROVED" : "REJECTED", timer);
     }
     if (
       actionId === VIEW_REQUEST_ACTION_ID ||
@@ -100,33 +121,48 @@ export async function POST(request: NextRequest) {
       actionId === OPEN_REQUEST_CENTER_ACTION_ID ||
       actionId === CREATE_REQUEST_ACTION_ID
     ) {
-      return handleRequestsNavigation(payload as RequestsNavigationPayload);
+      return handleRequestsNavigation(payload as RequestsNavigationPayload, timer);
     }
     if (actionId === REQUEST_TYPE_SELECT_ACTION_ID) {
-      return handleRequestTypeChanged(payload as RequestTypeChangedPayload);
+      return handleRequestTypeChanged(payload as RequestTypeChangedPayload, timer);
     }
     // Not one of our recognized actions — ignore safely.
+    timer.ack("ignored");
     return ack();
   }
 
   if (payload.type === "view_submission") {
     const callbackId = payload.view?.callback_id;
     if (callbackId === REQUEST_MODAL_CALLBACK_ID) {
-      return handleRequestSubmission(payload as ViewSubmissionPayload);
+      return handleRequestSubmission(payload as ViewSubmissionPayload, timer);
     }
     if (callbackId === APPROVE_DECISION_CALLBACK_ID || callbackId === REJECT_DECISION_CALLBACK_ID) {
-      return handleDecisionSubmission(payload as DecisionSubmissionPayload, callbackId === REJECT_DECISION_CALLBACK_ID ? "REJECTED" : "APPROVED");
+      return handleDecisionSubmission(payload as DecisionSubmissionPayload, callbackId === REJECT_DECISION_CALLBACK_ID ? "REJECTED" : "APPROVED", timer);
     }
+    timer.ack("ignored");
     return ack();
   }
 
+  timer.ack("ignored");
   return ack();
 }
 
-async function handleRequestSubmission(payload: ViewSubmissionPayload): Promise<Response> {
+/**
+ * M8.1: the request row is the only thing that must be durably committed
+ * before ack — everything after that (who to notify, and actually sending
+ * the notification) is best-effort and does not change whether the
+ * submission itself succeeded, so it runs in after(), after the response
+ * has already told Slack (and, by extension, the requester) that the
+ * request was created. This directly addresses the audit's finding that an
+ * awaited Promise.allSettled over every recipient's chat.postMessage could
+ * push total latency past Slack's ~3s view_submission window even though
+ * the row was already safely committed.
+ */
+async function handleRequestSubmission(payload: ViewSubmissionPayload, timer: RequestTimer): Promise<Response> {
   // Only view_submission for our modal is handled — anything else (other
   // interaction types, other callback_ids) is acknowledged as a no-op.
   if (payload.type !== "view_submission" || payload.view?.callback_id !== REQUEST_MODAL_CALLBACK_ID) {
+    timer.ack("ignored");
     return ack();
   }
 
@@ -136,24 +172,32 @@ async function handleRequestSubmission(payload: ViewSubmissionPayload): Promise<
   const slackTeamId = payload.team?.id;
   const slackUserId = payload.user?.id;
   if (!slackTeamId || !slackUserId) {
+    timer.ack("missing_identity");
     return modalErrors({ request_type_block: "Could not identify the Slack workspace or user. Please try again." });
   }
 
-  const workspace = await findWorkspaceBySlackTeamId(slackTeamId);
+  // Plain existence lookup, not the usable-installation guard: recording
+  // the request itself is a pure DB operation that doesn't touch the Slack
+  // API or need a token — only the notification tail (below, in after())
+  // does, and it re-resolves a fresh usable installation itself.
+  const workspace = await timer.time("db", "findWorkspace", () => findWorkspaceBySlackTeamId(slackTeamId));
   if (!workspace) {
+    timer.ack("workspace_not_found");
     return modalErrors({ request_type_block: "ApproveFlow isn't installed for this workspace anymore." });
   }
 
-  const requestTypes = await listActiveRequestTypes(workspace.id);
+  const requestTypes = await timer.time("db", "listActiveRequestTypes", () => listActiveRequestTypes(workspace.id));
   const result = validateRequestSubmission(payload, { validRequestTypeKeys: requestTypes.map((type) => type.key) });
   if (!result.ok) {
+    timer.ack("validation_error");
     return modalErrors(result.errors);
   }
 
-  const requester = await upsertSlackUser(workspace.id, result.data.slackUserId);
+  const requester = await timer.time("db", "upsertRequester", () => upsertSlackUser(workspace.id, result.data.slackUserId));
   const requestType = requestTypes.find((type) => type.key === result.data.requestTypeKey);
   if (!requestType) {
     // Race: the type could have been deactivated between listing it above and here.
+    timer.ack("type_race");
     return modalErrors({ request_type_block: "That request type is no longer available. Please try again." });
   }
 
@@ -168,8 +212,15 @@ async function handleRequestSubmission(payload: ViewSubmissionPayload): Promise<
   //
   // Case B: no active policy → DIRECT routing, using exactly the selected
   // approver, requiring exactly 1 approval.
-  const activePolicy = await findActivePolicyForRequestType(workspace.id, requestType.id);
-  const directApprover = await upsertSlackUser(workspace.id, result.data.selectedApproverSlackId);
+  //
+  // M8.1: these two lookups are independent of each other — parallelized
+  // instead of sequential, one fewer DB round trip before the insert.
+  const [activePolicy, directApprover] = await timer.time("db", "policyAndApprover", () =>
+    Promise.all([
+      findActivePolicyForRequestType(workspace.id, requestType.id),
+      upsertSlackUser(workspace.id, result.data.selectedApproverSlackId),
+    ]),
+  );
 
   const routingFields = activePolicy
     ? {
@@ -186,69 +237,97 @@ async function handleRequestSubmission(payload: ViewSubmissionPayload): Promise<
       };
 
   const supabase = getSupabaseAdmin();
-  const { data: inserted, error } = await supabase
-    .from("requests")
-    .insert({
-      workspace_id: workspace.id,
-      requester_id: requester.id,
-      request_type_id: requestType.id,
-      resource: result.data.resource,
-      // M8: "Reason" was merged into "Details" (resource) in the modal — the
-      // column stays nullable and unpopulated for new requests rather than
-      // duplicating the Details text into it. See validate-request-submission.ts.
-      reason: null,
-      // M8 correction: the fixed duration dropdown was replaced by the
-      // requested_start_date/time and requested_end_date/time columns below
-      // — this legacy column is retained only for historical rendering and
-      // is never populated by a new request.
-      requested_duration_minutes: null,
-      requested_start_date: result.data.timing.startDate,
-      requested_start_time: result.data.timing.startTime,
-      requested_end_date: result.data.timing.endDate,
-      requested_end_time: result.data.timing.endTime,
-      requested_amount: result.data.expense.amount,
-      requested_currency: result.data.expense.currency,
-      status: "PENDING",
-      idempotency_key: result.data.idempotencyKey,
-      ...routingFields,
-    })
-    .select("id")
-    .single();
+  const { data: inserted, error } = await timer.time("db", "insertRequest", async () =>
+    supabase
+      .from("requests")
+      .insert({
+        workspace_id: workspace.id,
+        requester_id: requester.id,
+        request_type_id: requestType.id,
+        resource: result.data.resource,
+        // M8: "Reason" was merged into "Details" (resource) in the modal — the
+        // column stays nullable and unpopulated for new requests rather than
+        // duplicating the Details text into it. See validate-request-submission.ts.
+        reason: null,
+        // M8 correction: the fixed duration dropdown was replaced by the
+        // requested_start_date/time and requested_end_date/time columns below
+        // — this legacy column is retained only for historical rendering and
+        // is never populated by a new request.
+        requested_duration_minutes: null,
+        requested_start_date: result.data.timing.startDate,
+        requested_start_time: result.data.timing.startTime,
+        requested_end_date: result.data.timing.endDate,
+        requested_end_time: result.data.timing.endTime,
+        requested_amount: result.data.expense.amount,
+        requested_currency: result.data.expense.currency,
+        status: "PENDING",
+        idempotency_key: result.data.idempotencyKey,
+        ...routingFields,
+      })
+      .select("id")
+      .single(),
+  );
 
   if (error) {
     if (error.code === POSTGRES_UNIQUE_VIOLATION) {
       // This exact submission was already persisted (e.g. Slack retried the
       // HTTP delivery) — treat as success, and do NOT notify approvers
       // again for a retry.
+      timer.ack("duplicate");
       return ack();
     }
     console.error("Failed to persist request:", error.message);
+    timer.ack("insert_error");
     return modalErrors({ request_type_block: "Something went wrong saving your request. Please try again." });
   }
 
-  // Best-effort notification — see notify-approvers.ts for why a failure
-  // here can't roll back or fail the response for the already-created,
-  // already-committed request.
-  try {
-    const recipients: NotificationRecipient[] = activePolicy
-      ? await listPolicyRecipients(activePolicy.id)
-      : [{ slack_user_id: result.data.selectedApproverSlackId, display_name: null }];
+  const requestId = inserted.id;
+  const requestTypeName = requestType.name;
+  const resource = result.data.resource;
+  const timing = result.data.timing;
+  const expense = result.data.expense;
+  const requesterSlackId = result.data.slackUserId;
+  const selectedApproverSlackId = result.data.selectedApproverSlackId;
+  const activePolicyId = activePolicy?.id ?? null;
 
-    await notifyApprovers({
-      workspace,
-      requestId: inserted.id,
-      requestTypeName: requestType.name,
-      resource: result.data.resource,
-      reason: null,
-      timing: result.data.timing,
-      expense: result.data.expense,
-      requester: { slack_user_id: result.data.slackUserId, display_name: null },
-      recipients,
-    });
-  } catch (notifyError) {
-    console.error("Unexpected error notifying approvers:", notifyError instanceof Error ? notifyError.message : "unknown error");
-  }
+  // Best-effort notification, deferred until after the response is sent —
+  // a Slack delivery failure (or slowness) here can't roll back or delay
+  // acknowledging the already-committed request. The background task only
+  // closes over immutable, already-resolved values (IDs, plain strings) and
+  // independently re-resolves a FRESH usable installation — never a
+  // workspace/token captured before the response, since installation state
+  // could change in the time between accepting this submission and the
+  // task actually running.
+  after(() =>
+    timer.afterTask("notifyApprovers", async () => {
+      try {
+        const usableWorkspace = await getUsableInstallation(slackTeamId);
+        if (!usableWorkspace) {
+          console.log(`Skipping approver notification for request ${requestId}: workspace has no usable Slack installation.`);
+          return;
+        }
+        const recipients: NotificationRecipient[] = activePolicyId
+          ? await listPolicyRecipients(activePolicyId)
+          : [{ slack_user_id: selectedApproverSlackId, display_name: null }];
 
+        await notifyApprovers({
+          workspace: usableWorkspace,
+          requestId,
+          requestTypeName,
+          resource,
+          reason: null,
+          timing,
+          expense,
+          requester: { slack_user_id: requesterSlackId, display_name: null },
+          recipients,
+        });
+      } catch (notifyError) {
+        console.error("Unexpected error notifying approvers:", notifyError instanceof Error ? notifyError.message : "unknown error");
+      }
+    }),
+  );
+
+  timer.ack("created");
   // Empty body closes the modal normally.
   return ack();
 }
@@ -287,18 +366,27 @@ function readCurrentField(payload: RequestTypeChangedPayload, blockId: string, a
 /**
  * The dynamic-modal step: selecting a Request Type re-renders the Create
  * Request modal in place with that type's field set (see
- * request-type-config.ts). This is UI state only — it never touches the
- * database beyond re-reading the workspace's active request types (the
- * exact same authoritative list the eventual submission is validated
- * against), and it never decides or authorizes anything. `views.update`
- * uses `view_id`/`hash` from the payload itself, not a `trigger_id` — same
- * mechanism M5/M7 already use to reflect a decision outcome in place.
+ * request-type-config.ts). This is UI state only — it never decides or
+ * authorizes anything, and the eventual submission independently
+ * re-validates against the FINAL selected type regardless of what this
+ * step rendered.
+ *
+ * M8.1: `views.update` here uses `view_id`/`hash`, never a `trigger_id` —
+ * unlike every `views.open`/`views.push` call in this file, this Slack API
+ * call has no few-seconds expiry to race against. There is therefore no
+ * correctness reason to keep it pre-ack: this handler now does only the
+ * minimal, synchronous presence checks before acking, then resolves the
+ * workspace, rebuilds the modal, and calls `views.update` entirely inside
+ * after(). A `hash_conflict` from rapid repeated type changes is still
+ * caught and logged, non-fatal, exactly as before.
  */
-async function handleRequestTypeChanged(payload: RequestTypeChangedPayload): Promise<Response> {
+async function handleRequestTypeChanged(payload: RequestTypeChangedPayload, timer: RequestTimer): Promise<Response> {
   const slackTeamId = payload.team?.id;
   const viewId = payload.view?.id;
+  const viewHash = payload.view?.hash;
   const newTypeKey = payload.actions?.[0]?.selected_option?.value;
   if (!slackTeamId || !viewId || !newTypeKey) {
+    timer.ack("ignored");
     return ack();
   }
 
@@ -310,53 +398,59 @@ async function handleRequestTypeChanged(payload: RequestTypeChangedPayload): Pro
     idempotencyKey = undefined;
   }
   if (!idempotencyKey) {
+    timer.ack("ignored");
     return ack();
   }
 
-  const workspace = await findWorkspaceBySlackTeamId(slackTeamId);
-  if (!workspace) {
-    return ack();
-  }
+  after(() =>
+    timer.afterTask("rebuildRequestModal", async () => {
+      try {
+        const workspace = await getUsableInstallation(slackTeamId);
+        if (!workspace) {
+          return;
+        }
 
-  try {
-    const requestTypes = await listActiveRequestTypes(workspace.id);
-    const newConfig = getRequestTypeFieldConfig(newTypeKey);
+        const requestTypes = await listActiveRequestTypes(workspace.id);
+        const newConfig = getRequestTypeFieldConfig(newTypeKey);
 
-    const currentTiming: RequestTiming = {
-      startDate: readCurrentField(payload, START_DATE_BLOCK_ID, START_DATE_ACTION_ID),
-      startTime: readCurrentField(payload, START_TIME_BLOCK_ID, START_TIME_ACTION_ID),
-      endDate: readCurrentField(payload, END_DATE_BLOCK_ID, END_DATE_ACTION_ID),
-      endTime: readCurrentField(payload, END_TIME_BLOCK_ID, END_TIME_ACTION_ID),
-    };
-    const currentExpense = {
-      amount: readCurrentField(payload, EXPENSE_AMOUNT_BLOCK_ID, EXPENSE_AMOUNT_ACTION_ID),
-      currency: readCurrentField(payload, EXPENSE_CURRENCY_BLOCK_ID, EXPENSE_CURRENCY_ACTION_ID),
-    };
+        const currentTiming: RequestTiming = {
+          startDate: readCurrentField(payload, START_DATE_BLOCK_ID, START_DATE_ACTION_ID),
+          startTime: readCurrentField(payload, START_TIME_BLOCK_ID, START_TIME_ACTION_ID),
+          endDate: readCurrentField(payload, END_DATE_BLOCK_ID, END_DATE_ACTION_ID),
+          endTime: readCurrentField(payload, END_TIME_BLOCK_ID, END_TIME_ACTION_ID),
+        };
+        const currentExpense = {
+          amount: readCurrentField(payload, EXPENSE_AMOUNT_BLOCK_ID, EXPENSE_AMOUNT_ACTION_ID),
+          currency: readCurrentField(payload, EXPENSE_CURRENCY_BLOCK_ID, EXPENSE_CURRENCY_ACTION_ID),
+        };
 
-    const preserved: PreservedRequestFields = {
-      // Details and Approver are universal — always carried over verbatim.
-      resource: readCurrentField(payload, "resource_block", "resource_input"),
-      approverSlackId: readCurrentField(payload, "approver_block", "approver_select"),
-      timing: remapTimingForModeChange(currentTiming, newConfig.timingMode),
-      expense: remapExpenseForModeChange(currentExpense, newConfig.expense),
-    };
+        const preserved: PreservedRequestFields = {
+          // Details and Approver are universal — always carried over verbatim.
+          resource: readCurrentField(payload, "resource_block", "resource_input"),
+          approverSlackId: readCurrentField(payload, "approver_block", "approver_select"),
+          timing: remapTimingForModeChange(currentTiming, newConfig.timingMode),
+          expense: remapExpenseForModeChange(currentExpense, newConfig.expense),
+        };
 
-    const view = buildRequestModal({ requestTypes, idempotencyKey, selectedTypeKey: newTypeKey, preserved });
+        const view = buildRequestModal({ requestTypes, idempotencyKey, selectedTypeKey: newTypeKey, preserved });
 
-    const botToken = decryptBotToken({
-      ciphertext: workspace.bot_access_token_ciphertext,
-      iv: workspace.bot_access_token_iv,
-      authTag: workspace.bot_access_token_auth_tag,
-    });
-    const client = new WebClient(botToken);
-    await client.views.update({ view_id: viewId, hash: payload.view?.hash, view } as Parameters<typeof client.views.update>[0]);
-  } catch (error) {
-    // Best-effort — includes a possible hash_conflict from rapid repeated
-    // type changes racing each other; either way, nothing was corrupted,
-    // the requester just doesn't see this particular update reflected.
-    console.error("Failed to rebuild Create Request modal for the new type:", error instanceof Error ? error.message : "unknown error");
-  }
+        const botToken = decryptBotToken({
+          ciphertext: workspace.bot_access_token_ciphertext,
+          iv: workspace.bot_access_token_iv,
+          authTag: workspace.bot_access_token_auth_tag,
+        });
+        const client = new WebClient(botToken);
+        await client.views.update({ view_id: viewId, hash: viewHash, view } as Parameters<typeof client.views.update>[0]);
+      } catch (error) {
+        // Best-effort — includes a possible hash_conflict from rapid repeated
+        // type changes racing each other; either way, nothing was corrupted,
+        // the requester just doesn't see this particular update reflected.
+        console.error("Failed to rebuild Create Request modal for the new type:", error instanceof Error ? error.message : "unknown error");
+      }
+    }),
+  );
 
+  timer.ack("accepted");
   return ack();
 }
 
@@ -370,17 +464,23 @@ async function handleRequestTypeChanged(payload: RequestTypeChangedPayload): Pro
  * vs. modal origin) travels forward via the decision modal's
  * private_metadata purely so the outcome can be reflected in the right
  * place afterward — never as an authorization signal.
+ *
+ * trigger_id-bound (views.open/views.push) — stays fully synchronous,
+ * pre-ack, per the M8.1 audit: this is one of the flows that must NOT be
+ * deferred to after().
  */
-async function handleOpenDecisionModal(payload: BlockActionsPayload, decision: Decision): Promise<Response> {
+async function handleOpenDecisionModal(payload: BlockActionsPayload, decision: Decision, timer: RequestTimer): Promise<Response> {
   const parsed = parseApprovalBlockAction(payload);
   if (!parsed.ok) {
     // Not one of our recognized actions, or malformed — ignore safely.
+    timer.ack("ignored");
     return ack();
   }
   const { slackTeamId, triggerId, requestId, source } = parsed.data;
 
-  const workspace = await findWorkspaceBySlackTeamId(slackTeamId);
+  const workspace = await timer.time("db", "getUsableInstallation", () => getUsableInstallation(slackTeamId));
   if (!workspace) {
+    timer.ack("not_installed");
     return ack();
   }
 
@@ -409,14 +509,17 @@ async function handleOpenDecisionModal(payload: BlockActionsPayload, decision: D
     // returns to Request Details, same convention as M6's origin-based
     // open/push branching.
     if (source.type === "modal") {
-      await client.views.push({ trigger_id: triggerId, view } as Parameters<typeof client.views.push>[0]);
+      await timer.time("slack_api", "views.push", () => client.views.push({ trigger_id: triggerId, view } as Parameters<typeof client.views.push>[0]));
     } else {
-      await client.views.open({ trigger_id: triggerId, view } as Parameters<typeof client.views.open>[0]);
+      await timer.time("slack_api", "views.open", () => client.views.open({ trigger_id: triggerId, view } as Parameters<typeof client.views.open>[0]));
     }
   } catch (error) {
     console.error("Failed to open decision modal:", error instanceof Error ? error.message : "unknown error");
+    timer.ack("error");
+    return ack();
   }
 
+  timer.ack("opened");
   return ack();
 }
 
@@ -475,93 +578,140 @@ const DECISION_NOT_APPLIED_OUTCOMES = new Set(["not_found", "already_final", "un
  * this matters most for POLICY routing, where membership is live: someone
  * removed from a policy between opening and submitting this modal is
  * rejected here exactly as if they'd never opened it.
+ *
+ * M8.1 modal-lifecycle analysis (audit-required): submitting this view
+ * either (a) fails to apply (DECISION_NOT_APPLIED_OUTCOMES) — reflected
+ * SYNCHRONOUSLY via `response_action: "update"`, which replaces THIS
+ * modal's own content in place as part of the HTTP response itself, no
+ * extra Slack API call involved — or (b) succeeds, in which case an empty
+ * `ack()` body is Slack's own signal to close this modal, which requires
+ * no work of ours at all. Everything this handler does AFTER a successful
+ * decide_on_request() targets a DIFFERENT, independent surface, never the
+ * view being closed by this response:
+ *   - message-origin: `chat.update` targets the original posted DM
+ *     message — entirely unaffected by this modal closing.
+ *   - modal-origin: `views.update` targets `source.viewId`, the Request
+ *     Details view this decision modal was PUSHED on top of — closing the
+ *     top of a view stack reveals what's underneath, it does not close it.
+ *     That view is therefore still open and a valid `views.update` target
+ *     after this response is sent, not "a view that ceases to exist."
+ * Both were already documented as best-effort (a failure here never
+ * affects the already-committed decision) even before this milestone, so
+ * moving them into after() does not introduce a new risk category — it
+ * only moves an already-non-critical, already-independent-surface update
+ * slightly later, off Slack's ~3s interactivity budget. The requester
+ * notification is the same story, gated exactly as before on
+ * isFinalDecisionTransition so a retried/duplicate submission (which
+ * decide_on_request reports as "already_decided") can never double-notify.
  */
-async function handleDecisionSubmission(payload: DecisionSubmissionPayload, decision: Decision): Promise<Response> {
+async function handleDecisionSubmission(payload: DecisionSubmissionPayload, decision: Decision, timer: RequestTimer): Promise<Response> {
   const parsed = validateDecisionSubmission(payload, decision);
   if (!parsed.ok) {
+    timer.ack("validation_error");
     return modalErrors(parsed.errors);
   }
   const { slackTeamId, slackUserId, requestId, source, comment } = parsed.data;
 
-  const workspace = await findWorkspaceBySlackTeamId(slackTeamId);
+  // Plain existence lookup, not the usable-installation guard: recording
+  // the decision is a pure DB operation via decide_on_request() and needs
+  // no Slack token — only the reflect/notify tail below does, and it
+  // re-resolves a fresh usable installation itself, inside after().
+  const workspace = await timer.time("db", "findWorkspace", () => findWorkspaceBySlackTeamId(slackTeamId));
   if (!workspace) {
+    timer.ack("workspace_not_found");
     return modalUpdate(buildErrorView("ApproveFlow isn't installed for this workspace anymore."));
   }
 
   let approverId: string;
   let result;
   try {
-    const approver = await upsertSlackUser(workspace.id, slackUserId);
+    const approver = await timer.time("db", "upsertApprover", () => upsertSlackUser(workspace.id, slackUserId));
     approverId = approver.id;
-    result = await decideOnRequest({ requestId, approverId, decision, comment });
+    result = await timer.time("db", "decideOnRequest", () => decideOnRequest({ requestId, approverId, decision, comment }));
   } catch (error) {
     console.error("Failed to record decision:", error instanceof Error ? error.message : "unknown error");
+    timer.ack("decide_error");
     return modalUpdate(buildErrorView("Something went wrong recording your decision. Please try again."));
   }
 
   if (DECISION_NOT_APPLIED_OUTCOMES.has(result.outcome)) {
     // Authorization/conflict outcome — nothing was recorded. Tell the user
-    // why instead of silently closing the modal as if it had worked.
+    // why instead of silently closing the modal as if it had worked. This
+    // is a synchronous response_action:update — no additional Slack API
+    // call, so there's nothing to defer here.
+    timer.ack(result.outcome);
     return modalUpdate(buildErrorView(describeDecisionOutcome(result)));
   }
 
-  // Best-effort: reflect the outcome where the click came from. A failure
-  // here doesn't affect the decision already committed above. The button
-  // could live in a posted DM (M3/M4) or in the M5 Request Details modal —
-  // decide_on_request()/the decision itself is identical either way; only
-  // how we show the result differs.
-  try {
-    const botToken = decryptBotToken({
-      ciphertext: workspace.bot_access_token_ciphertext,
-      iv: workspace.bot_access_token_iv,
-      authTag: workspace.bot_access_token_auth_tag,
-    });
-    const client = new WebClient(botToken);
-    const statusText = describeDecisionOutcome(result);
-
-    if (source.type === "message") {
-      const rebuilt = await rebuildApprovalMessageContent(workspace.id, requestId);
-      if (rebuilt) {
-        await client.chat.update(
-          {
-            channel: source.channelId,
-            ts: source.messageTs,
-            text: statusText,
-            blocks: replaceActionsWithStatus(rebuilt.blocks, statusText),
-          } as Parameters<typeof client.chat.update>[0],
-        );
+  // Best-effort, deferred to after() — see the handler's own doc comment
+  // above for why this is safe for both decision origins. Closes only over
+  // immutable, already-resolved values and independently re-resolves a
+  // FRESH usable installation, never a workspace/token captured before the
+  // response.
+  const decidedResult = result;
+  after(() =>
+    timer.afterTask("reflectAndNotify", async () => {
+      const usableWorkspace = await getUsableInstallation(slackTeamId);
+      if (!usableWorkspace) {
+        console.log(`Skipping decision reflection/notification for request ${requestId}: workspace has no usable Slack installation.`);
+        return;
       }
-    } else {
-      const details = await getRequestDetails(workspace.id, requestId, approverId);
-      const view = details ? buildRequestDetailsView({ details, banner: statusText }) : buildErrorView("This request could not be found.");
-      await client.views.update({ view_id: source.viewId, view } as Parameters<typeof client.views.update>[0]);
-    }
-  } catch (error) {
-    console.error("Failed to reflect decision outcome in Slack:", error instanceof Error ? error.message : "unknown error");
-  }
 
-  // Notify the original requester, but ONLY when THIS interaction actually
-  // caused a final transition — never for retries/duplicates/already-final
-  // requests/unauthorized attempts/intermediate policy approvals. Gating on
-  // the RPC's own outcome (rather than e.g. re-checking request status)
-  // means a Slack HTTP retry of the same submission — which decide_on_request
-  // reports as "already_decided" — can never trigger a second notification.
-  if (isFinalDecisionTransition(result.outcome)) {
-    try {
-      await notifyRequesterOfDecision({
-        workspace,
-        requestId,
-        decision: result.outcome === "approved" ? "APPROVED" : "REJECTED",
-        decidingApproverSlackId: slackUserId,
-      });
-    } catch (error) {
-      console.error("Failed to notify requester of decision:", error instanceof Error ? error.message : "unknown error");
-    }
-  }
+      try {
+        const botToken = decryptBotToken({
+          ciphertext: usableWorkspace.bot_access_token_ciphertext,
+          iv: usableWorkspace.bot_access_token_iv,
+          authTag: usableWorkspace.bot_access_token_auth_tag,
+        });
+        const client = new WebClient(botToken);
+        const statusText = describeDecisionOutcome(decidedResult);
 
+        if (source.type === "message") {
+          const rebuilt = await rebuildApprovalMessageContent(usableWorkspace.id, requestId);
+          if (rebuilt) {
+            await client.chat.update(
+              {
+                channel: source.channelId,
+                ts: source.messageTs,
+                text: statusText,
+                blocks: replaceActionsWithStatus(rebuilt.blocks, statusText),
+              } as Parameters<typeof client.chat.update>[0],
+            );
+          }
+        } else {
+          const details = await getRequestDetails(usableWorkspace.id, requestId, approverId);
+          const view = details ? buildRequestDetailsView({ details, banner: statusText }) : buildErrorView("This request could not be found.");
+          await client.views.update({ view_id: source.viewId, view } as Parameters<typeof client.views.update>[0]);
+        }
+      } catch (error) {
+        console.error("Failed to reflect decision outcome in Slack:", error instanceof Error ? error.message : "unknown error");
+      }
+
+      // Notify the original requester, but ONLY when THIS interaction
+      // actually caused a final transition — never for retries/duplicates/
+      // already-final requests/unauthorized attempts/intermediate policy
+      // approvals. Gating on the RPC's own outcome means a Slack HTTP retry
+      // of the same submission (reported as "already_decided") can never
+      // trigger a second notification.
+      if (isFinalDecisionTransition(decidedResult.outcome)) {
+        try {
+          await notifyRequesterOfDecision({
+            workspace: usableWorkspace,
+            requestId,
+            decision: decidedResult.outcome === "approved" ? "APPROVED" : "REJECTED",
+            decidingApproverSlackId: slackUserId,
+          });
+        } catch (error) {
+          console.error("Failed to notify requester of decision:", error instanceof Error ? error.message : "unknown error");
+        }
+      }
+    }),
+  );
+
+  timer.ack(decidedResult.outcome);
   // Empty body closes the decision modal — if it was pushed onto Request
-  // Details, this pops back to that (now-updated) view underneath, same as
-  // clicking Cancel would.
+  // Details, this pops back to that (now-updated, once after() runs) view
+  // underneath, same as clicking Cancel would.
   return ack();
 }
 
@@ -577,44 +727,66 @@ async function handleDecisionSubmission(payload: DecisionSubmissionPayload, deci
  * new top-level modal (views.open) — see the `origin` field on the parsed
  * result for why. Either way, the underlying view is built by the exact
  * same M5 functions.
+ *
+ * trigger_id-bound throughout — stays fully synchronous, pre-ack. M8.1
+ * only reduces the DB round trips ahead of the Slack call: Create Request's
+ * `upsertSlackUser` (whose result isn't used in that branch) runs
+ * concurrently with the ensure→list chain, and `getRequestDetails`'s own
+ * internal round trips were reduced separately (see request-views.ts).
  */
-async function handleRequestsNavigation(payload: RequestsNavigationPayload): Promise<Response> {
+async function handleRequestsNavigation(payload: RequestsNavigationPayload, timer: RequestTimer): Promise<Response> {
   const parsed = parseRequestsNavigationAction(payload);
   if (!parsed.ok) {
+    timer.ack("ignored");
     return ack();
   }
   const { slackTeamId, slackUserId, triggerId, origin } = parsed.data;
 
-  const workspace = await findWorkspaceBySlackTeamId(slackTeamId);
+  const workspace = await timer.time("db", "getUsableInstallation", () => getUsableInstallation(slackTeamId));
   if (!workspace) {
+    timer.ack("not_installed");
     return ack();
   }
 
   try {
-    const viewer = await upsertSlackUser(workspace.id, slackUserId);
-
     let view: ModalView;
-    if (parsed.data.actionId === VIEW_WAITING_REQUESTS_ACTION_ID) {
-      const waitingRequests = await listRequestsWaitingForApprover(workspace.id, viewer.id);
-      view = buildWaitingListView({ waitingRequests });
-    } else if (parsed.data.actionId === VIEW_REQUEST_ACTION_ID) {
-      // Revalidates workspace ownership again inside getRequestDetails —
-      // the request id from the button value is an opaque locator only.
-      const details = await getRequestDetails(workspace.id, parsed.data.requestId, viewer.id);
-      view = details ? buildRequestDetailsView({ details }) : buildErrorView("This request could not be found.");
-    } else if (parsed.data.actionId === OPEN_REQUEST_CENTER_ACTION_ID) {
-      const [{ rows: myRequests, totalCount }, waitingRequests] = await Promise.all([
-        listRequestsByRequester(workspace.id, viewer.id),
-        listRequestsWaitingForApprover(workspace.id, viewer.id),
-      ]);
-      view = buildRequestCenterView({ myRequests, myRequestsTotalCount: totalCount, waitingCount: waitingRequests.length });
-    } else {
-      // CREATE_REQUEST_ACTION_ID — mirrors /request's own bootstrap exactly,
-      // since Home must work for a user who has never run any command
-      // before.
-      await ensureDefaultRequestTypes(workspace.id);
-      const requestTypes = await listActiveRequestTypes(workspace.id);
+
+    if (parsed.data.actionId === CREATE_REQUEST_ACTION_ID) {
+      // Mirrors /request's own bootstrap exactly, since Home must work for
+      // a user who has never run any command before. `upsertSlackUser`'s
+      // result isn't needed by this branch, so it runs concurrently with
+      // the ensure→list chain rather than ahead of it.
+      const [, requestTypes] = await timer.time("db", "upsertUser+ensureAndListTypes", () =>
+        Promise.all([
+          upsertSlackUser(workspace.id, slackUserId),
+          (async () => {
+            await ensureDefaultRequestTypes(workspace.id);
+            return listActiveRequestTypes(workspace.id);
+          })(),
+        ]),
+      );
       view = buildRequestModal({ requestTypes, idempotencyKey: randomUUID() });
+    } else {
+      const viewer = await timer.time("db", "upsertViewer", () => upsertSlackUser(workspace.id, slackUserId));
+
+      if (parsed.data.actionId === VIEW_WAITING_REQUESTS_ACTION_ID) {
+        const waitingRequests = await timer.time("db", "listRequestsWaitingForApprover", () => listRequestsWaitingForApprover(workspace.id, viewer.id));
+        view = buildWaitingListView({ waitingRequests });
+      } else if (parsed.data.actionId === VIEW_REQUEST_ACTION_ID) {
+        // Revalidates workspace ownership again inside getRequestDetails —
+        // the request id from the button value is an opaque locator only.
+        // (Extracted to a plain const: TS discriminated-union narrowing
+        // doesn't extend into a closure re-accessing `parsed.data` itself.)
+        const requestId = parsed.data.requestId;
+        const details = await timer.time("db", "getRequestDetails", () => getRequestDetails(workspace.id, requestId, viewer.id));
+        view = details ? buildRequestDetailsView({ details }) : buildErrorView("This request could not be found.");
+      } else {
+        // OPEN_REQUEST_CENTER_ACTION_ID
+        const [{ rows: myRequests, totalCount }, waitingRequests] = await timer.time("db", "listRequestsForCenter", () =>
+          Promise.all([listRequestsByRequester(workspace.id, viewer.id), listRequestsWaitingForApprover(workspace.id, viewer.id)]),
+        );
+        view = buildRequestCenterView({ myRequests, myRequestsTotalCount: totalCount, waitingCount: waitingRequests.length });
+      }
     }
 
     const botToken = decryptBotToken({
@@ -624,13 +796,16 @@ async function handleRequestsNavigation(payload: RequestsNavigationPayload): Pro
     });
     const client = new WebClient(botToken);
     if (origin === "home") {
-      await client.views.open({ trigger_id: triggerId, view } as Parameters<typeof client.views.open>[0]);
+      await timer.time("slack_api", "views.open", () => client.views.open({ trigger_id: triggerId, view } as Parameters<typeof client.views.open>[0]));
     } else {
-      await client.views.push({ trigger_id: triggerId, view } as Parameters<typeof client.views.push>[0]);
+      await timer.time("slack_api", "views.push", () => client.views.push({ trigger_id: triggerId, view } as Parameters<typeof client.views.push>[0]));
     }
   } catch (error) {
     console.error("Failed to open/push /requests navigation view:", error instanceof Error ? error.message : "unknown error");
+    timer.ack("error");
+    return ack();
   }
 
+  timer.ack("opened");
   return ack();
 }

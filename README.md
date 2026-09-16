@@ -18,7 +18,26 @@ An earlier direction (see "Previously" below) explored positioning this as
 an AWS-access-request tool; M8 deliberately narrowed the MVP to this
 simpler, more universal workplace-approvals scope instead.
 
-## Current milestone: M8 — MVP Product Simplification
+## Current milestone: M8.1 — Slack Production Hardening
+
+M8.1 doesn't change the product surface at all — no new fields, no new
+request types, no UI changes anywhere. It hardens three things the M8 field
+matrix's own production E2E testing exposed as real gaps: (1) several Slack
+interaction handlers did more synchronous work before acknowledging Slack
+than the ~3 second interactivity window comfortably allows, occasionally
+making an action look like it silently failed; (2) there was no structured
+timing data anywhere to see *why*, only ad-hoc `console.error` strings on
+failure paths; and (3) `workspaces` had no concept of "uninstalled" at all —
+Slack's `app_uninstalled`/`tokens_revoked` events (now subscribed) were
+silently ignored. See [M8.1: Slack Production
+Hardening](#m81-slack-production-hardening) below for the full design:
+which work now happens via `next/server`'s `after()` instead of blocking
+the response, the new workspace installation lifecycle
+(`INSTALLED`/`TOKEN_REVOKED`/`UNINSTALLED`), and the minimal structured
+latency instrumentation added alongside it. **Implemented and locally
+verified — not yet deployed** (migration not yet pushed, nothing committed).
+
+## Previously: M8 — MVP Product Simplification
 
 M8 doesn't add new plumbing — M2–M7's request/approval/notification/comment
 pipeline is untouched — it changes *what the product is for*. The default
@@ -44,8 +63,8 @@ and input preservation from one shared definition. DIRECT
 (requester-picks-an-approver) routing remains the zero-config MVP default;
 the POLICY engine is untouched and still available as an advanced, optional
 capability; legacy technical request types remain in the database for
-historical rendering but are deactivated for new request creation. **Not
-yet deployed** — pending migration review.
+historical rendering but are deactivated for new request creation.
+**Deployed and production-E2E-verified** (`3cd9f3d`).
 
 ## Previously: M7 — Decision Comments & Rejection Reasons
 
@@ -407,33 +426,34 @@ is automated, and I have not modified your Slack app configuration myself.
    applies to the Events Request URL for local development — Slack cannot
    reach `http://localhost:3000` directly.
 
+## M8.1 Slack configuration: app_uninstalled and tokens_revoked
+
+Same **Features → Event Subscriptions → Subscribe to bot events** panel as
+M6 — no new Request URL, no new OAuth scope. Add `app_uninstalled` and
+`tokens_revoked` alongside the existing `app_home_opened`, then save. Like
+M6's own event subscription, this is an app **configuration** change, not
+an OAuth grant — existing installations start receiving both events as soon
+as this is saved, with no reinstall required. See [M8.1: Slack Production
+Hardening](#m81-slack-production-hardening) above for what the app does
+with each event.
+
 ## Local vs. production architecture
 
 Every route is a stateless Next.js Route Handler: no persistent Node
-server, no WebSockets, no background workers/queues. The slash command
-route does its work (workspace lookup, user upsert, ensuring default
-request types, decrypting the bot token, calling `views.open`) synchronously
-within the single request/response cycle, because Slack requires an ack
-within ~3 seconds and the `trigger_id` used to open a modal is itself only
-valid for a few seconds — there's no opportunity (or need) to defer work to
-a queue. Sending approver DMs (M3) similarly happens inline, right after
-the request is inserted, using `Promise.allSettled` so one approver's
-delivery failure doesn't block or fail the others. This runs as-is on
-Vercel serverless functions with no architectural changes between local and
-production.
-
-**M6's `/api/slack/events` follows the exact same synchronous pattern** —
-no queue, no `waitUntil`/`after()`, nothing pretending background work is
-durable when Vercel doesn't guarantee it. Handling `app_home_opened` is:
-verify signature → 2 small indexed queries (3 most recent requests, 1
-waiting-for-me count) → build the view → 1 `views.publish` call → ack. That
-comfortably fits inside Slack's ~3-second ack window, same as every other
-route in this app, so introducing a queue/worker for M6 would have been
-unwarranted complexity for a read-mostly, deterministic query path. A
-redelivered event (Slack retries on non-200/timeout) just republishes the
-same Home view again — `views.publish` always replaces the previous view
-wholesale, so a duplicate delivery is a harmless no-op, not a duplicate side
-effect the way a second notification DM would be.
+server, no WebSockets, no queue, no background worker service — this runs
+as-is on Vercel serverless functions with no architectural changes between
+local and production. Through M8, every route did all of its work
+(including notification sends) synchronously before responding. **As of
+M8.1, work that doesn't need to gate the HTTP response — approver/requester
+notifications, the request-type dynamic modal update, App Home publishing,
+and lifecycle event processing — runs via `next/server`'s `after()`
+instead, while `trigger_id`-bound `views.open`/`views.push` calls and
+anything the response's own correctness depends on stay synchronous.** See
+[M8.1: Slack Production Hardening](#m81-slack-production-hardening) above
+for the full per-flow breakdown, the latency instrumentation added
+alongside it, and why this still uses no queue/worker — `after()` runs
+within the same Vercel function invocation (via Vercel's `waitUntil`), not
+a separate durable job.
 
 ## Approval policy configuration (optional, M3)
 
@@ -1942,11 +1962,11 @@ switching to the same relative `./`/`../` import style every other pure
 cross-imported module in this codebase already uses. Purely a testability
 fix — zero behavior change, confirmed by an unchanged build output.
 
-## M8 end-to-end testing procedure (prepared, not yet executed — pending migration review)
+## M8 end-to-end testing procedure (completed — deployed and production-verified)
 
-Needs all four M8 migrations reviewed and pushed
-(`pnpm dlx supabase db push`, not run by me), including the not-yet-pushed
-`20260916020000_add_request_expense_fields.sql`.
+All four M8 migrations, including
+`20260916020000_add_request_expense_fields.sql`, are pushed and verified
+against production. The procedure below was executed as written.
 
 ### Test A — existing workspace upgrade: date range (Vacation / Time Off)
 
@@ -2046,6 +2066,361 @@ open Home → Create Request → confirm all 7 defaults appear immediately
 with zero SQL/script/manual Supabase setup → submit a DIRECT request →
 approver decides → requester notified.
 
+## M8.1: Slack Production Hardening
+
+### What M8.1 is, and what it deliberately isn't
+
+M8.1 is an internal-reliability milestone, not a product change — no field,
+button, or message a requester/approver sees is any different. It follows
+an audit of real production behavior after M8 shipped: some Slack actions
+occasionally looked like they silently failed (clicking again then
+"worked"), there was no structured way to see why, and Slack's own
+`app_uninstalled`/`tokens_revoked` events (now subscribed at the Slack app
+configuration level) were being silently ignored. M8.1 fixes exactly those
+three things.
+
+### ACK-first architecture: what stays synchronous, and why
+
+Every Slack-facing route in this app must return its HTTP response inside
+Slack's ~3 second interactivity/event window. Before M8.1, several handlers
+did ALL of their work — DB reads/writes and Slack Web API calls alike —
+synchronously before that response, including work that had no bearing on
+whether the response itself needed to say "success." M8.1 uses
+`after()` from `next/server` (Vercel's `waitUntil` under the hood — no new
+dependency, works on the Node.js runtime this project already targets, no
+`runtime`/`maxDuration` override needed) to move exactly the work that
+doesn't need to gate the response into a callback that runs after it's
+already been sent, while keeping everything the response's own correctness
+depends on synchronous. The dividing line, applied consistently across
+every handler:
+
+**Stays synchronous, pre-ack — never moved:**
+- Raw-body Slack signature verification, on every route, with no exception.
+- Any `views.open`/`views.push` call, because it consumes a `trigger_id` —
+  valid for only a few seconds after Slack issues it, and usable exactly
+  once. There is no way to defer this call; the only lever is doing less
+  DB work *before* it (see below).
+- `view_submission` field-level validation that might need to return
+  `response_action: "errors"` — Slack requires this to be part of the
+  synchronous HTTP response; there is no way to attach a field error
+  asynchronously after the fact.
+- The one write that the response's own "success" claim depends on: the
+  new `requests` row (Create Request submission) and the
+  `decide_on_request()` RPC call itself (decision submission) — the empty
+  response body that closes a modal must never be sent before the
+  corresponding row/decision is actually durably committed.
+
+**Moved into `after()`:**
+- Request-type dynamic change (`views.update`) — this call uses
+  `view_id`/`hash`, never a `trigger_id`, so it has no few-seconds expiry
+  to race against. The handler now does only the minimal synchronous
+  presence checks before acking, then resolves the workspace, rebuilds the
+  modal, and calls `views.update` entirely after the response.
+- Approver notification after a request is created (`chat.postMessage` to
+  one or more recipients) — the request row is already committed by the
+  time this runs; a slow or failed notification can no longer delay or
+  affect the "your request was created" response.
+- Reflecting a decision outcome (`chat.update` on the original approver DM,
+  or `views.update` on the underlying Request Details modal) and notifying
+  the requester, after a decision submission — both were already
+  best-effort (a failure never affected the already-committed decision)
+  even before M8.1; see "Decision modal lifecycle" below for why deferring
+  them is safe, not just convenient.
+- `app_home_opened`'s DB reads + `views.publish` — no `trigger_id`, and
+  nothing about the event's own (empty) response depends on Home actually
+  having been republished by the time it's sent. A redelivered event just
+  republishes the same view again — `views.publish` always replaces
+  wholesale, so redelivery is a harmless no-op.
+- `app_uninstalled`/`tokens_revoked` processing — same reasoning as
+  `app_home_opened`: no `trigger_id`, nothing in the response depends on
+  the lifecycle write completing synchronously, and both are idempotent by
+  construction (see below).
+
+Every background task now runs through `RequestTimer.afterTask()` (see
+Latency instrumentation below) rather than a bare `after(async () => {...})`
+call, so its own duration and success/failure are logged independently of
+the response that already went out.
+
+### Decision modal lifecycle: why deferring the reflect/notify tail is safe
+
+The audit specifically flagged a risk: "an empty successful `view_submission`
+ack may close the submitted modal — a deferred `views.update` against a
+view Slack has already closed may fail." This was checked directly rather
+than assumed away, for both decision origins:
+
+| Origin | What's open before submission | What ack() does | What the deferred update targets | Safe? |
+| --- | --- | --- | --- | --- |
+| Approve/Reject clicked on a posted DM message | Just the decision modal (opened via `views.open`) | Closes the decision modal | `chat.update` on the **original message** — a completely separate surface | Yes — the message was never part of the modal's lifecycle at all |
+| Approve/Reject clicked from Request Details (M5) | Request Details modal, with the decision modal **pushed** on top (`views.push`) | Pops/closes only the top of the stack (the decision modal) | `views.update` on `source.viewId`, the **Request Details view underneath** | Yes — closing the top of a view stack reveals what's underneath; it does not close it. Request Details is still open and a valid `views.update` target after the response is sent. |
+
+Neither deferred call ever targets the view that the response itself
+closes — only `response_action: "update"` (used for the "decision could not
+be applied" error case, e.g. `already_decided`/`unauthorized`) touches the
+actually-closing view, and that path is untouched: it's returned
+synchronously, as part of the HTTP response itself, with no separate Slack
+API call at all. Both deferred targets were already documented as
+best-effort before M8.1 (a failure there never affected the already-recorded
+decision) — moving them slightly later doesn't introduce a new risk
+category, it only moves an already-non-critical update off Slack's ~3
+second budget.
+
+### Reducing DB round trips on `trigger_id`-bound paths
+
+`views.open`/`views.push` calls can't be deferred, so the other lever is
+doing less — or more parallel — DB work before them:
+
+- `/request`, `/requests`, and "Create Request" from App Home: the
+  `upsertSlackUser` call (whose result isn't needed again in that specific
+  branch) now runs concurrently with the `ensureDefaultRequestTypes` →
+  `listActiveRequestTypes` chain, instead of strictly before it. That inner
+  chain itself stays sequential — a brand-new workspace's very first
+  command needs `ensureDefaultRequestTypes` to have committed before
+  `listActiveRequestTypes` can see the seeded rows.
+- "View Request" (`getRequestDetails`) on a POLICY-routed request was the
+  single largest round-trip chain in the app: a main select, then (in
+  sequence) a policy-name select, a policy-members select, and a dedicated
+  membership + own-decision check. The members query now also selects each
+  member's internal `user_id` (not just their Slack ID), and the decisions
+  query now also selects `approver_id` — with those two extra columns,
+  "is the viewer currently a member, and have they already decided" is
+  derived directly from data already being fetched, and the policy-name and
+  members queries run in parallel instead of sequentially. This removes two
+  entire round trips and parallelizes two more, without changing what's
+  authorized — the same membership/already-decided facts are checked, just
+  read once instead of re-queried.
+- `listRequestsWaitingForApprover`'s remaining two-stage chain (policy
+  candidates → excluding already-decided ones) was left unchanged: it's a
+  genuine data dependency (the second query needs the first query's
+  candidate IDs), not incidental sequencing, and the audit's own guidance
+  was not to force a joined/anti-join query or a new RPC where a clean one
+  doesn't already exist.
+
+No new `SECURITY DEFINER` RPC was added for any of this — every
+optimization above is either parallelizing genuinely independent reads or
+reusing data already being fetched, never a new join across the
+authorization boundary.
+
+### Latency instrumentation
+
+`src/lib/observability/timing.ts` is the one shared utility, used by every
+Slack-facing route instead of the old ad-hoc `console.error`-only logging.
+`createRequestTimer(route, flow)` returns a small object that:
+
+- Assigns a correlation `requestId` (a fresh UUID) to every request/event.
+- Records signature-verification and payload-parsing time (`markVerify`/`markParse`).
+- Wraps individual DB calls and Slack Web API calls (`time("db"|"slack_api", label, fn)`),
+  accumulating each bucket's running total and immediately logging an
+  individual line if that one call is slow (≥400ms for a DB call, ≥900ms
+  for a Slack API call) — so a single slow call is identifiable even inside
+  an otherwise-fast request.
+- Logs one structured JSON summary line per request (`ack(outcome)`),
+  called immediately before the HTTP response is constructed — `info` under
+  1000ms, `warn` at/above 1000ms, `error` at/above 2500ms (approaching
+  Slack's ~3s window).
+- Wraps every `after()` background task (`afterTask(label, fn)`), logging
+  its own duration and ok/error outcome independently — a slow or failing
+  background task is visible without ever having delayed the response.
+
+It is pure and fully injectable (`now`/`log`/`requestId` overrides), with
+no `server-only` dependency, matching this project's established pattern
+for testable primitives (see `verify-request.ts`'s injectable `nowSeconds`)
+— directly unit tested in `timing.test.ts` with no mocking required.
+Events API retry headers (`X-Slack-Retry-Num`/`X-Slack-Retry-Reason`) are
+recorded as observational metadata alongside the timing log when present —
+never used to skip processing; correctness comes from idempotent handling
+of every event, not from assuming Slack delivers exactly once.
+
+**Never logged, by any code path:** Slack bot tokens (encrypted or not),
+the signing secret, OAuth codes, raw `Authorization`/signature headers,
+decision comments, rejection reasons, request Details/`resource` text, or
+any other request content. Only IDs, route/flow/bucket/label names,
+durations, and outcome strings — no telemetry vendor, no new dependency.
+
+### Workspace installation lifecycle
+
+Before M8.1, `workspaces` had no notion of "installed" at all — a row
+either existed (implicitly installed) or it didn't. A new column,
+`installation_status` (`text` + `CHECK`, matching this project's existing
+convention for `requests.status`/`approvals.decision`/`requests.routing_type`
+rather than a native Postgres `ENUM`), now tracks three states:
+
+| State | Meaning | Bot token |
+| --- | --- | --- |
+| `INSTALLED` | Normal, usable installation | Present, decryptable |
+| `TOKEN_REVOKED` | Slack sent `tokens_revoked` for this workspace's bot token specifically | Cleared (`NULL`) |
+| `UNINSTALLED` | Slack sent `app_uninstalled` | Cleared (`NULL`) |
+
+`TOKEN_REVOKED` is deliberately distinct from `UNINSTALLED`, even though
+every guard in the app (see below) treats them identically — a revoked
+token is not proof the whole app was removed, and collapsing the two would
+lose that distinction for support/debugging. A new nullable
+`uninstalled_at timestamptz` records when a workspace transitioned into
+`UNINSTALLED` — set only on that specific transition, never reset by a
+redelivered `app_uninstalled`. The three `bot_access_token_*` columns are
+now nullable (relaxed, not dropped) so they can be cleared rather than left
+holding a token Slack has already invalidated.
+
+Deliberately **not** added: a `first_installed_at` column (`created_at`
+already records when the workspace row was first created, and
+`installed_at` already means "most recent successful install" — a third
+timestamp would be redundant for this MVP), an index on
+`installation_status` (irrelevant at today's workspace count; trivial to
+add later), and any trigger or lifecycle RPC (every writer of this column
+is already-trusted, signature-verified, service-role server code — unlike
+`decide_on_request()`, there's no RLS-bypass/anon-client surface here to
+defend against).
+
+### `app_uninstalled`
+
+Resolved from the same signed `team_id` already used for `app_home_opened`.
+Handling is idempotent by construction: a pure function,
+`computeInstallationTransition({ currentStatus, event })`
+(`src/lib/requests/compute-installation-transition.ts`, exhaustively unit
+tested for every state × event combination and both delivery orders),
+decides the next state and whether `uninstalled_at` should be (re)set —
+`UNINSTALLED` is reachable from `INSTALLED` or `TOKEN_REVOKED`, and a
+redelivered `app_uninstalled` while already `UNINSTALLED` computes the same
+end state without touching the existing `uninstalled_at`. The workspace row
+itself, and everything that references it (requests, approvals, users,
+request types, policies), is never touched beyond the three lifecycle
+columns — nothing is hard-deleted.
+
+### `tokens_revoked`
+
+Slack's `tokens_revoked` payload lists revoked token identifiers — for a
+bot token, `event.tokens.bot` is an array of **bot user IDs**, not token
+strings. This app already stores the bot user ID from the original OAuth
+response (`workspaces.bot_user_id`), so the safe match is: *does the
+revoked list include OUR stored bot user ID?* If `bot_user_id` is missing
+(shouldn't happen for a real bot-token install) or simply not present in
+the revoked list, **no change is made** — a conservative, deliberate
+choice. `tokens_revoked` does not, on its own, prove the whole app
+installation is gone (unlike `app_uninstalled`), so inventing a broader
+identity match beyond this exact comparison was avoided rather than risking
+disabling a working installation over an unrelated event. When it does
+match: `installation_status` becomes `TOKEN_REVOKED` (unless already
+`UNINSTALLED`, which never regresses backward), the token is cleared, and
+`uninstalled_at` is left untouched — that field means specifically "we
+received `app_uninstalled`." Receiving `app_uninstalled` and
+`tokens_revoked` in either order, any number of times, converges on the
+same end state, with `UNINSTALLED` always winning as the more final one —
+see `compute-installation-transition.test.ts` for every combination this
+claim rests on.
+
+### Centralized usable-installation guard
+
+`getUsableInstallation(slackTeamId)` (`src/lib/requests/workspace-lookup.ts`)
+is the single place that answers "can we currently call the Slack API for
+this workspace" — usable only if `installation_status === 'INSTALLED'` AND
+all three encrypted-token columns are present, failing closed identically
+for an unknown workspace, an uninstalled one, a token-revoked one, or a
+corrupt/partial token row. Its underlying predicate,
+`isUsableInstallation()` (`src/lib/requests/installation-usability.ts`), is
+a plain, dependency-free type guard, kept in its own module specifically so
+it's unit testable without a database — the same split this project already
+uses for `decide_on_request()` (SQL) vs. `compute-decision-outcome.ts`
+(its pure, tested mirror).
+
+Every call site that is about to decrypt a bot token or call the Slack Web
+API now uses this guard instead of the older bare `if (!workspace)` check:
+both slash commands, every `interactions` handler that opens/updates a view
+or sends a message, and `app_home_opened`'s publish step. The plain,
+status-agnostic `findWorkspaceBySlackTeamId` lookup is still used
+deliberately in three places where token usability is irrelevant: the
+OAuth callback (the one place allowed to transition a workspace *into*
+`INSTALLED` — depending on the guard there would be circular), the
+`app_uninstalled`/`tokens_revoked` handlers themselves (which must be able
+to look up and update a workspace regardless of its current status), and
+recording a decision or a new request's authoritative DB row (a pure
+Postgres operation that needs no Slack token at all — only the
+best-effort notification/reflection tail that follows re-resolves a fresh
+usable installation via the guard, inside `after()`).
+
+Uninstalling a workspace never makes its history unreadable — every guard
+above only blocks *new* Slack API activity; reading historical
+requests/approvals/decisions from Postgres was never gated on installation
+status and still isn't.
+
+### OAuth install/reinstall semantics
+
+The OAuth callback's upsert (keyed on `slack_team_id`, unchanged since M1)
+now unconditionally sets `installation_status = 'INSTALLED'` and
+`uninstalled_at = NULL` on every successful completion — fresh install or
+reinstall after an uninstall/token-revocation alike. No "is this a
+reinstall" branch was needed: upserting fixed values is idempotent
+regardless of the row's prior state. The bot token is always replaced (Slack
+always issues a fresh one), `installed_at` is always set to "now" (it means
+"most recent install," not "first install"), and the same workspace row —
+same `id`, same historical requests/approvals/users/request
+types/policies — is reused exactly as it was before M8.1.
+
+### Migration
+
+One new additive migration —
+`supabase/migrations/20260917000000_add_workspace_installation_lifecycle.sql`
+— not yet pushed. None of the prior M1–M8 migration files are edited.
+Adds `installation_status text not null default 'INSTALLED' check (...)`
+(the default backfills the current production workspace correctly with no
+separate `UPDATE`, since it genuinely is installed today), `uninstalled_at
+timestamptz null`, and relaxes `NOT NULL` on the three
+`bot_access_token_*` columns. See the migration file's own header comment
+for the full reasoning, including why `first_installed_at`, an index, and a
+lifecycle RPC were all deliberately left out of this milestone.
+
+## M8.1 end-to-end testing procedure (prepared, not yet executed — pending migration review)
+
+Needs the new lifecycle migration reviewed and pushed
+(`pnpm dlx supabase db push`, not run automatically).
+
+### Test A — responsiveness: request-type switching feels instant
+
+Open Create Request, select a few different Request Types in a row.
+Verify each switch re-renders the modal with no perceptible delay, and that
+Details/Approver survive every switch while type-specific fields
+appear/disappear/are dropped exactly per the M8 field matrix.
+
+### Test B — responsiveness: decision submission
+
+Approve or Reject a pending request. Verify the modal closes immediately,
+the original message/Request Details view updates shortly after (not
+necessarily instantly), and the requester is notified. Compare the felt
+latency to before M8.1 if possible.
+
+### Test C — uninstall → app_uninstalled
+
+1. Confirm the existing workspace is `INSTALLED` (`select
+   installation_status from workspaces`).
+2. Create a request — still works.
+3. Uninstall ApproveFlow from Slack's app management page.
+4. Confirm `app_uninstalled` arrives and `installation_status` becomes
+   `UNINSTALLED`, `uninstalled_at` is set, and all three bot token columns
+   are `NULL`.
+5. Confirm all historical requests/approvals/users/request types/policies
+   are still present and readable.
+
+### Test D — reinstall
+
+6. Reinstall ApproveFlow through the OAuth flow.
+7. Confirm the **same** `workspaces.id` row is reused (compare the UUID
+   before/after).
+8. Confirm a new encrypted bot token is stored, `installation_status` is
+   `INSTALLED` again, and `uninstalled_at` is `NULL` again.
+9. Confirm Request Center still shows the pre-uninstall history, a new
+   request can be created, approval still works, and the requester is
+   notified.
+
+### Test E — `tokens_revoked` (best-effort; only if Slack makes this practical to trigger deliberately)
+
+If Slack's app management UI exposes a way to revoke just the bot token
+without a full uninstall, trigger it and confirm `installation_status`
+becomes `TOKEN_REVOKED`, the token is cleared, new Slack API attempts for
+that workspace are safely blocked by the usable-installation guard
+(ephemeral "isn't installed right now" message, not a crash), and
+historical data remains readable. If Slack provides no practical way to
+trigger this deliberately, this test is deferred — the same conservative
+matching logic is already exhaustively unit tested in
+`compute-installation-transition.test.ts`.
+
 ## Project structure
 
 ```
@@ -2059,14 +2434,17 @@ src/
         commands/
           request/route.ts         # POST /api/slack/commands/request — /request slash command
           requests/route.ts        # POST /api/slack/commands/requests — /requests slash command (M5)
-        events/route.ts            # POST /api/slack/events — Events API: url_verification + app_home_opened (M6)
-        interactions/route.ts      # POST /api/slack/interactions — modal submissions, Approve/Reject, /requests + Home navigation
+        events/route.ts            # POST /api/slack/events — Events API: url_verification, app_home_opened, app_uninstalled, tokens_revoked (M6; extended M8.1); ACKs immediately, all DB/Slack work via after()
+        interactions/route.ts      # POST /api/slack/interactions — modal submissions, Approve/Reject, /requests + Home navigation (M8.1: after() for non-trigger_id work, latency instrumentation)
     slack/installed/page.tsx       # OAuth result page
     page.tsx                       # home page (Add to Slack button)
     layout.tsx
   lib/
     env.ts                        # public, client-safe env vars
     env.server.ts                 # server-only env vars (secrets)
+    observability/
+      timing.ts                   # pure (M8.1): shared structured latency-instrumentation utility (unit tested)
+      timing.test.ts
     crypto/
       token-cipher.ts             # pure AES-256-GCM primitives (unit tested)
       token-cipher.test.ts
@@ -2079,7 +2457,7 @@ src/
       verify-request.test.ts
       format-date.ts              # pure (M5): Slack date-token formatting (unit tested)
       format-date.test.ts
-      parse-slack-event.ts        # pure (M6): Events API envelope classifier — url_verification / app_home_opened / ignored (unit tested)
+      parse-slack-event.ts        # pure (M6, extended M8.1): Events API envelope classifier — url_verification / app_home_opened / app_uninstalled / tokens_revoked / ignored (unit tested)
       parse-slack-event.test.ts
     requests/
       duration-options.ts         # pure: HISTORICAL-ONLY duration label lookup (M8 correction: original M2-M7 scale only, unit tested)
@@ -2091,7 +2469,11 @@ src/
       expense.ts                  # pure (M8 field-matrix correction): amount/currency validation + the shared "Amount" formatter (unit tested)
       expense.test.ts
       request-types.ts            # server-only: default request types + idempotent seeding (M8: 7 workplace types replace the original 5)
-      workspace-lookup.ts         # server-only: workspace/user lookup+upsert
+      installation-usability.ts   # pure (M8.1): isUsableInstallation() type guard behind getUsableInstallation() (unit tested)
+      installation-usability.test.ts
+      compute-installation-transition.ts  # pure (M8.1): app_uninstalled/tokens_revoked lifecycle transition rules (unit tested, no SQL mirror needed — see file header)
+      compute-installation-transition.test.ts
+      workspace-lookup.ts         # server-only: workspace/user lookup+upsert; M8.1: + getUsableInstallation() centralized guard
       build-request-modal.ts      # pure: request-type-aware Block Kit modal builder, dynamically shaped per TimingMode/expense (M8 field-matrix correction; unit tested)
       build-request-modal.test.ts
       validate-request-submission.ts  # pure: view_submission validation, type-specific per REQUEST_TYPE_FIELD_CONFIG (unit tested; M8 field-matrix correction)
@@ -2109,8 +2491,8 @@ src/
       build-requester-decision-notification.test.ts
       approval-actions.ts         # server-only: decide_on_request() RPC wrapper (M7: + comment param)
       approval-policies.ts        # server-only: active-policy lookup + policy recipient list
-      notify-approvers.ts         # server-only: sends DMs to a precomputed recipient list
-      notify-requester.ts         # server-only: sends the final-decision DM to the requester
+      notify-approvers.ts         # server-only: sends DMs to a precomputed recipient list (M8.1: takes an already-usable installation; called via after())
+      notify-requester.ts         # server-only: sends the final-decision DM to the requester (M8.1: takes an already-usable installation; called via after())
       status-display.ts           # pure (M5): status emoji + text label (unit tested)
       status-display.test.ts
       parse-requests-action.ts    # pure (M5, extended M6): /requests + Home navigation click validation, incl. views.open vs. views.push origin (unit tested)
@@ -2119,11 +2501,11 @@ src/
       build-requests-views.test.ts
       build-app-home-view.ts      # pure (M6): App Home Block Kit view builder, reuses build-requests-views' row builder (unit tested; M8: updated intro copy)
       build-app-home-view.test.ts
-      request-views.ts            # server-only (M5, extended M6/M7): listRequestsByRequester (optional limit), listRequestsWaitingForApprover, getRequestDetails (M7: + approval comment)
+      request-views.ts            # server-only (M5, extended M6/M7): listRequestsByRequester (optional limit), listRequestsWaitingForApprover, getRequestDetails (M7: + approval comment; M8.1: fewer/parallelized round trips in the POLICY branch)
     supabase/
       admin.ts                    # server-only: service-role Supabase client
   types/
-    workspace.ts                  # Workspace row type
+    workspace.ts                  # Workspace row type (M8.1: + InstallationStatus, uninstalled_at, nullable token fields)
     request.ts                    # User, RequestType, RequestRow types (incl. M4 routing fields; M8: reason is nullable)
     approval.ts                   # ApprovalPolicy, Approval, DecideOnRequestResult types
 

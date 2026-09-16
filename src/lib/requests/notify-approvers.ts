@@ -5,8 +5,8 @@ import { WebClient } from "@slack/web-api";
 import { buildApprovalNotification } from "@/lib/requests/build-approval-notification";
 import type { RequestExpense } from "@/lib/requests/expense";
 import type { RequestTiming } from "@/lib/requests/request-timing";
+import type { UsableWorkspace } from "@/lib/requests/workspace-lookup";
 import { decryptBotToken } from "@/lib/slack/token-encryption";
-import type { Workspace } from "@/types/workspace";
 
 export interface NotificationRecipient {
   slack_user_id: string;
@@ -14,7 +14,8 @@ export interface NotificationRecipient {
 }
 
 export interface NotifyApproversParams {
-  workspace: Workspace;
+  /** Must already be confirmed usable (see getUsableInstallation) — this function decrypts unconditionally, never re-checks installation status itself. */
+  workspace: UsableWorkspace;
   requestId: string;
   requestTypeName: string;
   resource: string;

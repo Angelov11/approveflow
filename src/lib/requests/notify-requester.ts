@@ -4,12 +4,13 @@ import { WebClient } from "@slack/web-api";
 
 import { buildRequesterDecisionNotification } from "@/lib/requests/build-requester-decision-notification";
 import type { RequestTiming } from "@/lib/requests/request-timing";
+import type { UsableWorkspace } from "@/lib/requests/workspace-lookup";
 import { decryptBotToken } from "@/lib/slack/token-encryption";
 import { getSupabaseAdmin } from "@/lib/supabase/admin";
-import type { Workspace } from "@/types/workspace";
 
 export interface NotifyRequesterOfDecisionParams {
-  workspace: Workspace;
+  /** Must already be confirmed usable (see getUsableInstallation) — this function decrypts unconditionally, never re-checks installation status itself. */
+  workspace: UsableWorkspace;
   requestId: string;
   decision: "APPROVED" | "REJECTED";
   /** The Slack user whose click caused this final transition — resolved server-side from the trusted, signature-verified payload, never the button contents. */

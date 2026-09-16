@@ -66,3 +66,50 @@ test("a completely empty envelope is safely ignored, never throws", () => {
     assert.deepEqual(parseSlackEvent({}), { kind: "ignored" });
   });
 });
+
+// --- M8.1: app_uninstalled ---
+
+test("app_uninstalled is accepted with the team id", () => {
+  const result = parseSlackEvent({ type: "event_callback", team_id: "T123", event: { type: "app_uninstalled" } });
+  assert.deepEqual(result, { kind: "app_uninstalled", slackTeamId: "T123" });
+});
+
+test("app_uninstalled missing team_id is safely ignored", () => {
+  const result = parseSlackEvent({ type: "event_callback", event: { type: "app_uninstalled" } });
+  assert.deepEqual(result, { kind: "ignored" });
+});
+
+// --- M8.1: tokens_revoked ---
+
+test("tokens_revoked is accepted with the team id and the revoked bot user ids", () => {
+  const result = parseSlackEvent({
+    type: "event_callback",
+    team_id: "T123",
+    event: { type: "tokens_revoked", tokens: { bot: ["U_BOT_1"], oauth: ["U_USER_1"] } },
+  });
+  assert.deepEqual(result, { kind: "tokens_revoked", slackTeamId: "T123", revokedBotUserIds: ["U_BOT_1"] });
+});
+
+test("tokens_revoked with no bot tokens in the payload still parses, with an empty revokedBotUserIds list", () => {
+  const result = parseSlackEvent({
+    type: "event_callback",
+    team_id: "T123",
+    event: { type: "tokens_revoked", tokens: { oauth: ["U_USER_1"] } },
+  });
+  assert.deepEqual(result, { kind: "tokens_revoked", slackTeamId: "T123", revokedBotUserIds: [] });
+});
+
+test("tokens_revoked with a malformed tokens.bot value never throws and treats it as empty", () => {
+  const result = parseSlackEvent({
+    type: "event_callback",
+    team_id: "T123",
+    // @ts-expect-error deliberately malformed to prove this never throws
+    event: { type: "tokens_revoked", tokens: { bot: "not-an-array" } },
+  });
+  assert.deepEqual(result, { kind: "tokens_revoked", slackTeamId: "T123", revokedBotUserIds: [] });
+});
+
+test("tokens_revoked missing team_id is safely ignored", () => {
+  const result = parseSlackEvent({ type: "event_callback", event: { type: "tokens_revoked", tokens: { bot: ["U_BOT_1"] } } });
+  assert.deepEqual(result, { kind: "ignored" });
+});

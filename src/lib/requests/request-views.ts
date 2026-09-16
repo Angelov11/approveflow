@@ -142,22 +142,6 @@ export async function listRequestsWaitingForApprover(workspaceId: string, userId
   return merged.map(toSummary);
 }
 
-async function isCurrentlyAuthorizedForPolicy(policyId: string, requestId: string, userId: string): Promise<boolean> {
-  const supabase = getSupabaseAdmin();
-  const [membership, ownDecision] = await Promise.all([
-    supabase.from("approval_policy_members").select("user_id").eq("policy_id", policyId).eq("user_id", userId).maybeSingle(),
-    supabase.from("approvals").select("id").eq("request_id", requestId).eq("approver_id", userId).maybeSingle(),
-  ]);
-
-  if (membership.error) {
-    throw new Error(`Failed to check policy membership: ${membership.error.message}`);
-  }
-  if (ownDecision.error) {
-    throw new Error(`Failed to check existing decision: ${ownDecision.error.message}`);
-  }
-  return Boolean(membership.data) && !ownDecision.data;
-}
-
 /**
  * Requires request.workspace_id === workspaceId — returns null (not an
  * error) for a request that doesn't exist OR belongs to a different
@@ -186,13 +170,19 @@ export async function getRequestDetails(workspaceId: string, requestId: string, 
   const requestType = Array.isArray(request.request_types) ? request.request_types[0] : request.request_types;
   const requester = Array.isArray(request.users) ? request.users[0] : request.users;
 
+  // M8.1: `approver_id` is fetched alongside the existing decision columns
+  // specifically so the POLICY branch below can derive "has viewerUserId
+  // already decided" from this SAME result, instead of a dedicated extra
+  // query (see the removed isCurrentlyAuthorizedForPolicy helper) — trading
+  // one extra selected column for one fewer sequential DB round trip on
+  // this trigger_id-bound path (View Request).
   const [directApprover, decisionsResult] = await Promise.all([
     request.routing_type === "DIRECT" && request.direct_approver_id
       ? supabase.from("users").select("slack_user_id").eq("id", request.direct_approver_id).maybeSingle()
       : Promise.resolve({ data: null, error: null }),
     supabase
       .from("approvals")
-      .select("decision, comment, users(slack_user_id)")
+      .select("approver_id, decision, comment, users(slack_user_id)")
       .eq("request_id", requestId)
       .order("decided_at", { ascending: true }),
   ]);
@@ -201,7 +191,8 @@ export async function getRequestDetails(workspaceId: string, requestId: string, 
     throw new Error(`Failed to load decisions: ${decisionsResult.error.message}`);
   }
 
-  const decisions = (decisionsResult.data ?? []).map((row) => {
+  const decisionRows = decisionsResult.data ?? [];
+  const decisions = decisionRows.map((row) => {
     const user = Array.isArray(row.users) ? row.users[0] : row.users;
     return { slackUserId: user?.slack_user_id ?? "unknown", decision: row.decision as "APPROVED" | "REJECTED", comment: row.comment };
   });
@@ -214,19 +205,19 @@ export async function getRequestDetails(workspaceId: string, requestId: string, 
     routing = { type: "DIRECT", approverSlackUserId };
     canCurrentUserDecide = request.status === "PENDING" && request.direct_approver_id === viewerUserId;
   } else if (request.approval_policy_id) {
-    const { data: policy, error: policyError } = await supabase
-      .from("approval_policies")
-      .select("name, required_approvals")
-      .eq("id", request.approval_policy_id)
-      .maybeSingle();
+    // M8.1: policy + members are independent reads — fetched in parallel
+    // instead of sequentially (this branch previously awaited them one
+    // after another). "Is viewerUserId currently a member and has NOT
+    // already decided" is now derived from this members list plus the
+    // decisionRows already fetched above, eliminating the two extra
+    // queries isCurrentlyAuthorizedForPolicy used to make.
+    const [{ data: policy, error: policyError }, { data: members, error: membersError }] = await Promise.all([
+      supabase.from("approval_policies").select("name, required_approvals").eq("id", request.approval_policy_id).maybeSingle(),
+      supabase.from("approval_policy_members").select("user_id, users(slack_user_id)").eq("policy_id", request.approval_policy_id),
+    ]);
     if (policyError) {
       throw new Error(`Failed to load policy: ${policyError.message}`);
     }
-
-    const { data: members, error: membersError } = await supabase
-      .from("approval_policy_members")
-      .select("users(slack_user_id)")
-      .eq("policy_id", request.approval_policy_id);
     if (membersError) {
       throw new Error(`Failed to load policy members: ${membersError.message}`);
     }
@@ -242,7 +233,10 @@ export async function getRequestDetails(workspaceId: string, requestId: string, 
       requiredApprovals: policy?.required_approvals ?? 1,
       pendingMemberSlackUserIds,
     };
-    canCurrentUserDecide = request.status === "PENDING" && (await isCurrentlyAuthorizedForPolicy(request.approval_policy_id, requestId, viewerUserId));
+
+    const isMember = (members ?? []).some((row) => row.user_id === viewerUserId);
+    const hasAlreadyDecided = decisionRows.some((row) => row.approver_id === viewerUserId);
+    canCurrentUserDecide = request.status === "PENDING" && isMember && !hasAlreadyDecided;
   } else {
     // Historical row predating routing snapshots — see the M4 backfill.
     routing = { type: "POLICY_UNAVAILABLE" };
