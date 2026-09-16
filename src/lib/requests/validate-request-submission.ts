@@ -1,4 +1,15 @@
-import { resolveDurationMinutes } from "./duration-options.ts";
+import {
+  END_DATE_ACTION_ID,
+  END_DATE_BLOCK_ID,
+  END_TIME_ACTION_ID,
+  END_TIME_BLOCK_ID,
+  START_DATE_ACTION_ID,
+  START_DATE_BLOCK_ID,
+  START_TIME_ACTION_ID,
+  START_TIME_BLOCK_ID,
+  validateRequestTiming,
+  type RequestTiming,
+} from "./request-timing.ts";
 
 /**
  * Minimal shape of a Slack `view_submission` interaction payload — just the
@@ -16,7 +27,16 @@ export interface ViewSubmissionPayload {
     state?: {
       values?: Record<
         string,
-        Record<string, { value?: string | null; selected_option?: { value?: string } | null; selected_user?: string | null }>
+        Record<
+          string,
+          {
+            value?: string | null;
+            selected_option?: { value?: string } | null;
+            selected_user?: string | null;
+            selected_date?: string | null;
+            selected_time?: string | null;
+          }
+        >
       >;
     };
   };
@@ -29,7 +49,8 @@ export interface ValidatedRequestSubmission {
   requestTypeKey: string;
   /** M8: "Details" in the UI — free-text description of the request. Stored in the `resource` column (unrenamed; see build-request-modal.ts). */
   resource: string;
-  requestedDurationMinutes: number | null;
+  /** M8 correction: replaces the fixed duration dropdown — see request-timing.ts. */
+  timing: RequestTiming;
   /** The Slack user ID selected via the modal's native picker — an identifier only, not an authorization claim. See the interactions route for how it's actually used (or discarded) depending on routing. */
   selectedApproverSlackId: string;
 }
@@ -47,7 +68,11 @@ const SLACK_USER_ID_PATTERN = /^[UW][A-Z0-9]{2,}$/i;
 
 function getFieldValue(payload: ViewSubmissionPayload, blockId: string, actionId: string): string | undefined {
   const field = payload.view?.state?.values?.[blockId]?.[actionId];
-  return field?.selected_option?.value ?? field?.selected_user ?? field?.value ?? undefined;
+  return field?.selected_option?.value ?? field?.selected_user ?? field?.selected_date ?? field?.selected_time ?? field?.value ?? undefined;
+}
+
+function getOptionalFieldValue(payload: ViewSubmissionPayload, blockId: string, actionId: string): string | null {
+  return getFieldValue(payload, blockId, actionId) ?? null;
 }
 
 /**
@@ -59,7 +84,11 @@ function getFieldValue(payload: ViewSubmissionPayload, blockId: string, actionId
  * M8: no longer collects a separate "Reason" — merged into "Details"
  * (resource_block). The database's `reason` column is nullable and simply
  * left unpopulated for new submissions (see the interactions route); no
- * fabricated/duplicated content is written to it.
+ * fabricated/duplicated content is written to it. The fixed duration
+ * dropdown is gone entirely — timing is validated via
+ * request-timing.ts's validateRequestTiming, whose per-field errors are
+ * merged in directly (its block IDs are its own dedicated blocks, so there
+ * is no collision with any error key here).
  */
 export function validateRequestSubmission(
   payload: ViewSubmissionPayload,
@@ -98,18 +127,22 @@ export function validateRequestSubmission(
     errors.resource_block = `Details must be ${MAX_DETAILS_LENGTH} characters or fewer.`;
   }
 
-  const durationValue = getFieldValue(payload, "duration_block", "duration_select");
-  const requestedDurationMinutes = durationValue ? resolveDurationMinutes(durationValue) : undefined;
-  if (durationValue === undefined || requestedDurationMinutes === undefined) {
-    errors.duration_block = "Please select when / how long.";
+  const timing: RequestTiming = {
+    startDate: getOptionalFieldValue(payload, START_DATE_BLOCK_ID, START_DATE_ACTION_ID),
+    startTime: getOptionalFieldValue(payload, START_TIME_BLOCK_ID, START_TIME_ACTION_ID),
+    endDate: getOptionalFieldValue(payload, END_DATE_BLOCK_ID, END_DATE_ACTION_ID),
+    endTime: getOptionalFieldValue(payload, END_TIME_BLOCK_ID, END_TIME_ACTION_ID),
+  };
+  const timingResult = validateRequestTiming(timing);
+  if (!timingResult.ok) {
+    Object.assign(errors, timingResult.errors);
   }
 
   // Required even though a POLICY-routed submission will end up ignoring
   // it server-side — the modal can't know client-side whether a policy
   // exists for the currently-selected request type without dynamic modal
-  // mutation, which M4 deliberately doesn't implement. See build-request-
-  // modal.ts's hint text and the interactions route for how this is
-  // resolved/discarded depending on routing.
+  // mutation, which M4 deliberately doesn't implement. See the interactions
+  // route for how this is resolved/discarded depending on routing.
   const selectedApproverSlackId = getFieldValue(payload, "approver_block", "approver_select");
   if (!selectedApproverSlackId || !SLACK_USER_ID_PATTERN.test(selectedApproverSlackId)) {
     errors.approver_block = "Please select an approver.";
@@ -127,7 +160,7 @@ export function validateRequestSubmission(
       idempotencyKey,
       requestTypeKey: requestTypeKey as string,
       resource,
-      requestedDurationMinutes: requestedDurationMinutes as number | null,
+      timing,
       selectedApproverSlackId: selectedApproverSlackId as string,
     },
   };

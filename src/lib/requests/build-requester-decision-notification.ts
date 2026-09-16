@@ -1,3 +1,5 @@
+import { formatWhenLabel, type RequestTiming } from "./request-timing.ts";
+
 export type DecisionOutcome =
   | "not_found"
   | "already_final"
@@ -32,7 +34,9 @@ export interface BuildRequesterDecisionNotificationParams {
   decision: "APPROVED" | "REJECTED";
   requestTypeName: string;
   resource: string;
-  durationLabel: string;
+  timing: RequestTiming;
+  /** Non-null only for pre-M8-correction historical requests — see request-timing.ts's formatWhenLabel. */
+  legacyDurationMinutes: number | null;
   routingType: "POLICY" | "DIRECT";
   /** The Slack user whose click caused this transition. */
   decidingApproverSlackId: string;
@@ -51,7 +55,8 @@ export function buildRequesterDecisionNotification({
   decision,
   requestTypeName,
   resource,
-  durationLabel,
+  timing,
+  legacyDurationMinutes,
   routingType,
   decidingApproverSlackId,
   comment,
@@ -70,9 +75,12 @@ export function buildRequesterDecisionNotification({
   const fields: { type: "mrkdwn"; text: string }[] = [
     { type: "mrkdwn", text: `*Request type:*\n${requestTypeName}` },
     { type: "mrkdwn", text: `*Details:*\n${resource}` },
-    { type: "mrkdwn", text: `*When / Duration:*\n${durationLabel}` },
-    { type: "mrkdwn", text: `*Status:*\n${decision}` },
   ];
+  const when = formatWhenLabel(timing, legacyDurationMinutes);
+  if (when) {
+    fields.push({ type: "mrkdwn", text: `*${when.label}:*\n${when.value}` });
+  }
+  fields.push({ type: "mrkdwn", text: `*Status:*\n${decision}` });
   if (showDecidingApprover) {
     fields.push({
       type: "mrkdwn",

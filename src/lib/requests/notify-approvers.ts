@@ -3,7 +3,7 @@ import "server-only";
 import { WebClient } from "@slack/web-api";
 
 import { buildApprovalNotification } from "@/lib/requests/build-approval-notification";
-import { formatDurationLabel } from "@/lib/requests/duration-options";
+import type { RequestTiming } from "@/lib/requests/request-timing";
 import { decryptBotToken } from "@/lib/slack/token-encryption";
 import type { Workspace } from "@/types/workspace";
 
@@ -18,7 +18,7 @@ export interface NotifyApproversParams {
   requestTypeName: string;
   resource: string;
   reason: string | null;
-  requestedDurationMinutes: number | null;
+  timing: RequestTiming;
   requester: { slack_user_id: string; display_name: string | null };
   /**
    * Precomputed by the caller (the interactions route): the policy's
@@ -49,7 +49,7 @@ export async function notifyApprovers({
   requestTypeName,
   resource,
   reason,
-  requestedDurationMinutes,
+  timing,
   requester,
   recipients,
 }: NotifyApproversParams): Promise<void> {
@@ -76,7 +76,13 @@ export async function notifyApprovers({
     requester,
     resource,
     reason,
-    durationLabel: formatDurationLabel(requestedDurationMinutes),
+    timing,
+    // Always null here — this function only ever fires for a request just
+    // created in this same request cycle (see the interactions route),
+    // which by construction has no legacy duration. The historical fallback
+    // in buildApprovalNotification exists for rebuildApprovalMessageContent
+    // (M7's post-decision message rebuild), not for this initial send.
+    legacyDurationMinutes: null,
   });
 
   const client = new WebClient(botToken);

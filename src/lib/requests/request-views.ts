@@ -1,28 +1,41 @@
 import "server-only";
 
 import type { RequestDetailsView, RequestSummary } from "@/lib/requests/build-requests-views";
-import { formatDurationLabel } from "@/lib/requests/duration-options";
+import { formatWhenLabel, type RequestTiming } from "@/lib/requests/request-timing";
 import { getSupabaseAdmin } from "@/lib/supabase/admin";
 
 const MY_REQUESTS_LIMIT = 10;
+
+const REQUEST_SUMMARY_COLUMNS =
+  "id, resource, status, requested_duration_minutes, requested_start_date, requested_start_time, requested_end_date, requested_end_time, created_at, request_types(name)";
 
 interface RequestSummaryRow {
   id: string;
   resource: string;
   status: RequestSummary["status"];
   requested_duration_minutes: number | null;
+  requested_start_date: string | null;
+  requested_start_time: string | null;
+  requested_end_date: string | null;
+  requested_end_time: string | null;
   created_at: string;
   request_types: { name: string } | { name: string }[] | null;
 }
 
 function toSummary(row: RequestSummaryRow): RequestSummary {
   const requestType = Array.isArray(row.request_types) ? row.request_types[0] : row.request_types;
+  const timing: RequestTiming = {
+    startDate: row.requested_start_date,
+    startTime: row.requested_start_time,
+    endDate: row.requested_end_date,
+    endTime: row.requested_end_time,
+  };
   return {
     id: row.id,
     requestTypeName: requestType?.name ?? "Unknown request type",
     resource: row.resource,
     status: row.status,
-    durationLabel: formatDurationLabel(row.requested_duration_minutes),
+    whenText: formatWhenLabel(timing, row.requested_duration_minutes)?.value ?? null,
     createdAt: row.created_at,
   };
 }
@@ -43,7 +56,7 @@ export async function listRequestsByRequester(workspaceId: string, requesterId: 
   const supabase = getSupabaseAdmin();
   const { data, error, count } = await supabase
     .from("requests")
-    .select("id, resource, status, requested_duration_minutes, created_at, request_types(name)", { count: "exact" })
+    .select(REQUEST_SUMMARY_COLUMNS, { count: "exact" })
     .eq("workspace_id", workspaceId)
     .eq("requester_id", requesterId)
     .order("created_at", { ascending: false })
@@ -69,7 +82,7 @@ export async function listRequestsWaitingForApprover(workspaceId: string, userId
 
   const directRequestsPromise = supabase
     .from("requests")
-    .select("id, resource, status, requested_duration_minutes, created_at, request_types(name)")
+    .select(REQUEST_SUMMARY_COLUMNS)
     .eq("workspace_id", workspaceId)
     .eq("status", "PENDING")
     .eq("routing_type", "DIRECT")
@@ -92,7 +105,7 @@ export async function listRequestsWaitingForApprover(workspaceId: string, userId
   if (policyIds.length > 0) {
     const { data: candidates, error: candidatesError } = await supabase
       .from("requests")
-      .select("id, resource, status, requested_duration_minutes, created_at, request_types(name)")
+      .select(REQUEST_SUMMARY_COLUMNS)
       .eq("workspace_id", workspaceId)
       .eq("status", "PENDING")
       .eq("routing_type", "POLICY")
@@ -153,7 +166,7 @@ export async function getRequestDetails(workspaceId: string, requestId: string, 
   const { data: request, error: requestError } = await supabase
     .from("requests")
     .select(
-      "id, resource, reason, status, requested_duration_minutes, created_at, requester_id, routing_type, approval_policy_id, direct_approver_id, request_types(name), users!requests_requester_id_fkey(slack_user_id)",
+      "id, resource, reason, status, requested_duration_minutes, requested_start_date, requested_start_time, requested_end_date, requested_end_time, created_at, requester_id, routing_type, approval_policy_id, direct_approver_id, request_types(name), users!requests_requester_id_fkey(slack_user_id)",
     )
     .eq("id", requestId)
     .eq("workspace_id", workspaceId)
@@ -232,12 +245,19 @@ export async function getRequestDetails(workspaceId: string, requestId: string, 
     canCurrentUserDecide = false;
   }
 
+  const timing: RequestTiming = {
+    startDate: request.requested_start_date,
+    startTime: request.requested_start_time,
+    endDate: request.requested_end_date,
+    endTime: request.requested_end_time,
+  };
+
   return {
     id: request.id,
     requestTypeName: requestType?.name ?? "Unknown request type",
     resource: request.resource,
     reason: request.reason,
-    durationLabel: formatDurationLabel(request.requested_duration_minutes),
+    when: formatWhenLabel(timing, request.requested_duration_minutes),
     status: request.status,
     createdAt: request.created_at,
     requesterSlackUserId: requester?.slack_user_id ?? "unknown",

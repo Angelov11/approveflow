@@ -17,7 +17,7 @@ const sampleRequest: RequestSummary = {
   requestTypeName: "Custom Request",
   resource: "AWS Test Resource",
   status: "PENDING",
-  durationLabel: "2 hours",
+  whenText: "2 hours",
   createdAt: "2026-09-15T20:00:00.000Z",
 };
 
@@ -79,7 +79,7 @@ const baseDetails: RequestDetailsView = {
   requestTypeName: "Custom Request",
   resource: "AWS Test Resource",
   reason: "Need it for testing",
-  durationLabel: "2 hours",
+  when: { label: "When / Duration", value: "2 hours" },
   status: "PENDING",
   createdAt: "2026-09-15T20:00:00.000Z",
   requesterSlackUserId: "U0REQUESTER",
@@ -212,12 +212,27 @@ test("a banner renders when provided (stale-modal outcome messaging)", () => {
 
 // --- M8: workplace terminology ---
 
-test("uses 'Details' and 'When / Duration' labels, never 'Resource' or bare 'Duration'", () => {
+test("uses 'Details' and the historical 'When / Duration' label, never bare 'Resource' or 'Duration'", () => {
   const text = blocksToText(buildRequestDetailsView({ details: { ...baseDetails, reason: null } }));
   assert.ok(text.includes("*Details:*"));
   assert.ok(text.includes("*When / Duration:*"));
   assert.ok(!text.includes("*Resource:*"));
   assert.ok(!text.includes("*Duration:*"));
+});
+
+test("a new (post-M8-correction) request with real timing uses the 'When' label, not 'When / Duration'", () => {
+  const text = blocksToText(
+    buildRequestDetailsView({ details: { ...baseDetails, reason: null, when: { label: "When", value: "Sep 19, 2026" } } }),
+  );
+  assert.ok(text.includes("*When:*"));
+  assert.ok(text.includes("Sep 19, 2026"));
+  assert.ok(!text.includes("*When / Duration:*"));
+});
+
+test("a request with no timing at all shows no When field — no placeholder", () => {
+  const text = blocksToText(buildRequestDetailsView({ details: { ...baseDetails, reason: null, when: null } }));
+  assert.ok(!text.includes("*When"));
+  assert.ok(!text.includes("Not specified"));
 });
 
 test("a pre-M8 historical request with a reason still shows a Reason field", () => {

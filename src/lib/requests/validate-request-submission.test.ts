@@ -9,7 +9,10 @@ function buildPayload(
   overrides: {
     requestType?: string;
     resource?: string;
-    duration?: string;
+    startDate?: string | null;
+    startTime?: string | null;
+    endDate?: string | null;
+    endTime?: string | null;
     privateMetadata?: string;
     approver?: string | null;
   } = {},
@@ -17,7 +20,10 @@ function buildPayload(
   const {
     requestType = "vacation_time_off",
     resource = "Family vacation",
-    duration = "1440",
+    startDate = "2026-09-21",
+    startTime = null,
+    endDate = "2026-09-25",
+    endTime = null,
     privateMetadata = JSON.stringify({ idempotencyKey: "11111111-1111-1111-1111-111111111111" }),
     approver = "U0GARY123",
   } = overrides;
@@ -33,7 +39,10 @@ function buildPayload(
         values: {
           request_type_block: { request_type_select: { selected_option: { value: requestType } } },
           resource_block: { resource_input: { value: resource } },
-          duration_block: { duration_select: { selected_option: { value: duration } } },
+          start_date_block: { start_date_picker: { selected_date: startDate ?? undefined } },
+          start_time_block: { start_time_picker: { selected_time: startTime ?? undefined } },
+          end_date_block: { end_date_picker: { selected_date: endDate ?? undefined } },
+          end_time_block: { end_time_picker: { selected_time: endTime ?? undefined } },
           approver_block: { approver_select: { selected_user: approver ?? undefined } },
         },
       },
@@ -41,7 +50,7 @@ function buildPayload(
   };
 }
 
-test("valid submission is accepted", () => {
+test("valid submission is accepted, with the timing mapped exactly as supplied", () => {
   const result = validateRequestSubmission(buildPayload(), { validRequestTypeKeys });
   assert.equal(result.ok, true);
   if (result.ok) {
@@ -49,7 +58,7 @@ test("valid submission is accepted", () => {
     assert.equal(result.data.slackUserId, "U123");
     assert.equal(result.data.requestTypeKey, "vacation_time_off");
     assert.equal(result.data.resource, "Family vacation");
-    assert.equal(result.data.requestedDurationMinutes, 1440);
+    assert.deepEqual(result.data.timing, { startDate: "2026-09-21", startTime: null, endDate: "2026-09-25", endTime: null });
     assert.equal(result.data.idempotencyKey, "11111111-1111-1111-1111-111111111111");
     assert.equal(result.data.selectedApproverSlackId, "U0GARY123");
   }
@@ -63,19 +72,34 @@ test("no separate 'reason' field is collected — Details is the only free-text 
   }
 });
 
-test("'not applicable' / 'other, not specified' duration resolves to null minutes", () => {
-  const result = validateRequestSubmission(buildPayload({ duration: "not_applicable" }), { validRequestTypeKeys });
+test("all timing fields omitted maps to an all-null timing object and still succeeds", () => {
+  const result = validateRequestSubmission(
+    buildPayload({ startDate: null, startTime: null, endDate: null, endTime: null }),
+    { validRequestTypeKeys },
+  );
   assert.equal(result.ok, true);
   if (result.ok) {
-    assert.equal(result.data.requestedDurationMinutes, null);
+    assert.deepEqual(result.data.timing, { startDate: null, startTime: null, endDate: null, endTime: null });
   }
 });
 
-test("a multi-day duration option (e.g. '2 days') resolves correctly", () => {
-  const result = validateRequestSubmission(buildPayload({ duration: "2880" }), { validRequestTypeKeys });
+test("a same-day timed submission maps every field exactly", () => {
+  const result = validateRequestSubmission(
+    buildPayload({ startDate: "2026-09-18", startTime: "10:00", endDate: "2026-09-18", endTime: "12:00" }),
+    { validRequestTypeKeys },
+  );
   assert.equal(result.ok, true);
   if (result.ok) {
-    assert.equal(result.data.requestedDurationMinutes, 2880);
+    assert.deepEqual(result.data.timing, { startDate: "2026-09-18", startTime: "10:00", endDate: "2026-09-18", endTime: "12:00" });
+  }
+});
+
+test("an invalid timing combination surfaces as a field error and rejects the whole submission", () => {
+  // end time without an end date — invalid per request-timing.ts
+  const result = validateRequestSubmission(buildPayload({ endDate: null, endTime: "12:00" }), { validRequestTypeKeys });
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.ok(result.errors.end_time_block);
   }
 });
 
@@ -96,14 +120,6 @@ test("a legacy/deactivated request type key is rejected the same as any other in
   assert.equal(result.ok, false);
   if (!result.ok) {
     assert.ok(result.errors.request_type_block);
-  }
-});
-
-test("malformed/unknown duration is rejected with a field error", () => {
-  const result = validateRequestSubmission(buildPayload({ duration: "999" }), { validRequestTypeKeys });
-  assert.equal(result.ok, false);
-  if (!result.ok) {
-    assert.ok(result.errors.duration_block);
   }
 });
 
@@ -129,9 +145,10 @@ test("missing/malformed private_metadata is rejected", () => {
 });
 
 test("multiple invalid fields all report their own errors", () => {
-  const result = validateRequestSubmission(buildPayload({ requestType: "bogus", resource: "", duration: "bogus" }), {
-    validRequestTypeKeys,
-  });
+  const result = validateRequestSubmission(
+    buildPayload({ requestType: "bogus", resource: "", endDate: null, endTime: "12:00" }),
+    { validRequestTypeKeys },
+  );
   assert.equal(result.ok, false);
   if (!result.ok) {
     assert.equal(Object.keys(result.errors).length, 3);

@@ -3,7 +3,7 @@ import "server-only";
 import { WebClient } from "@slack/web-api";
 
 import { buildRequesterDecisionNotification } from "@/lib/requests/build-requester-decision-notification";
-import { formatDurationLabel } from "@/lib/requests/duration-options";
+import type { RequestTiming } from "@/lib/requests/request-timing";
 import { decryptBotToken } from "@/lib/slack/token-encryption";
 import { getSupabaseAdmin } from "@/lib/supabase/admin";
 import type { Workspace } from "@/types/workspace";
@@ -46,7 +46,9 @@ export async function notifyRequesterOfDecision({
 
   const { data: request, error: requestError } = await supabase
     .from("requests")
-    .select("resource, requested_duration_minutes, routing_type, requester_id, request_type_id")
+    .select(
+      "resource, requested_duration_minutes, requested_start_date, requested_start_time, requested_end_date, requested_end_time, routing_type, requester_id, request_type_id",
+    )
     .eq("id", requestId)
     .single();
 
@@ -97,11 +99,19 @@ export async function notifyRequesterOfDecision({
     return;
   }
 
+  const timing: RequestTiming = {
+    startDate: request.requested_start_date,
+    startTime: request.requested_start_time,
+    endDate: request.requested_end_date,
+    endTime: request.requested_end_time,
+  };
+
   const content = buildRequesterDecisionNotification({
     decision,
     requestTypeName: requestTypeResult.data.name,
     resource: request.resource,
-    durationLabel: formatDurationLabel(request.requested_duration_minutes),
+    timing,
+    legacyDurationMinutes: request.requested_duration_minutes,
     routingType: request.routing_type,
     decidingApproverSlackId,
     comment: decisionCommentResult.data?.comment ?? null,

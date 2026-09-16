@@ -12,7 +12,7 @@ const sampleRequest: RequestSummary = {
   requestTypeName: "Custom Request",
   resource: "AWS Test Resource",
   status: "PENDING",
-  durationLabel: "2 hours",
+  whenText: "2 hours",
   createdAt: "2026-09-15T20:00:00.000Z",
 };
 

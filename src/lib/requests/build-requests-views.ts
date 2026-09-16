@@ -4,6 +4,7 @@ import { formatSlackDate } from "../slack/format-date.ts";
 import type { RequestStatus } from "../../types/request.ts";
 import { APPROVE_ACTION_ID, REJECT_ACTION_ID } from "./build-approval-notification.ts";
 import { VIEW_REQUEST_ACTION_ID, VIEW_WAITING_REQUESTS_ACTION_ID } from "./parse-requests-action.ts";
+import type { WhenLabel } from "./request-timing.ts";
 import { formatStatusLabel } from "./status-display.ts";
 
 export const REQUEST_CENTER_CALLBACK_ID = "approveflow_request_center";
@@ -29,7 +30,8 @@ export interface RequestSummary {
   requestTypeName: string;
   resource: string;
   status: RequestStatus;
-  durationLabel: string;
+  /** Precomputed by request-views.ts via request-timing.ts's formatWhenLabel — null when there's genuinely nothing to show (never rendered as a placeholder). */
+  whenText: string | null;
   createdAt: string;
 }
 
@@ -58,7 +60,8 @@ export interface RequestDetailsView {
   resource: string;
   /** M8: null for every new request (merged into Details) — non-null only for pre-M8 historical requests, which still show it as "Reason". */
   reason: string | null;
-  durationLabel: string;
+  /** Precomputed by request-views.ts via request-timing.ts's formatWhenLabel — null when there's genuinely nothing to show (field omitted entirely, never a placeholder). */
+  when: WhenLabel | null;
   status: RequestStatus;
   createdAt: string;
   requesterSlackUserId: string;
@@ -70,19 +73,22 @@ export interface RequestDetailsView {
 
 /** Exported for reuse by the App Home builder (M6) — Home's "My Requests" rows are the exact same shape as the Request Center's. */
 export function buildRequestRowBlocks(requests: RequestSummary[]): unknown[] {
-  return requests.map((r) => ({
-    type: "section",
-    text: {
-      type: "mrkdwn",
-      text: `${formatStatusLabel(r.status)}\n*${r.requestTypeName}* — ${r.resource}\n${r.durationLabel} · Requested ${formatSlackDate(r.createdAt)}`,
-    },
-    accessory: {
-      type: "button",
-      action_id: VIEW_REQUEST_ACTION_ID,
-      text: { type: "plain_text", text: "View" },
-      value: JSON.stringify({ requestId: r.id }),
-    },
-  }));
+  return requests.map((r) => {
+    const timingLine = r.whenText ? `${r.whenText} · ` : "";
+    return {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: `${formatStatusLabel(r.status)}\n*${r.requestTypeName}* — ${r.resource}\n${timingLine}Requested ${formatSlackDate(r.createdAt)}`,
+      },
+      accessory: {
+        type: "button",
+        action_id: VIEW_REQUEST_ACTION_ID,
+        text: { type: "plain_text", text: "View" },
+        value: JSON.stringify({ requestId: r.id }),
+      },
+    };
+  });
 }
 
 export interface BuildRequestCenterViewParams {
@@ -191,8 +197,10 @@ export function buildRequestDetailsView({ details, banner }: BuildRequestDetails
   if (details.reason) {
     detailFields.push({ type: "mrkdwn", text: `*Reason:*\n${details.reason}` });
   }
+  if (details.when) {
+    detailFields.push({ type: "mrkdwn", text: `*${details.when.label}:*\n${details.when.value}` });
+  }
   detailFields.push(
-    { type: "mrkdwn", text: `*When / Duration:*\n${details.durationLabel}` },
     { type: "mrkdwn", text: `*Requester:*\n<@${details.requesterSlackUserId}>` },
     { type: "mrkdwn", text: `*Status:*\n${formatStatusLabel(details.status)}` },
   );

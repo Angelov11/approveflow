@@ -5,17 +5,24 @@ import {
   isFinalDecisionTransition,
   type DecisionOutcome,
 } from "./build-requester-decision-notification.ts";
+import type { RequestTiming } from "./request-timing.ts";
 
 function fieldTexts(content: ReturnType<typeof buildRequesterDecisionNotification>): string[] {
   const fieldsBlock = content.blocks[1] as { fields: { text: string }[] };
   return fieldsBlock.fields.map((f) => f.text);
 }
 
+const NO_TIMING: RequestTiming = { startDate: null, startTime: null, endDate: null, endTime: null };
+
 const baseParams = {
   decision: "APPROVED" as const,
   requestTypeName: "Custom Request",
   resource: "AWS Test Resource",
-  durationLabel: "2 hours",
+  timing: NO_TIMING,
+  // A pre-M8-correction historical value (120 minutes = "2 hours" under the
+  // original scale) — exercises the legacy fallback path in every test that
+  // doesn't override it with real timing.
+  legacyDurationMinutes: 120,
   routingType: "DIRECT" as const,
   decidingApproverSlackId: "U0APPROVER1",
   comment: null,
@@ -77,13 +84,30 @@ test("POLICY rejection DOES attribute the rejecting approver (rejection always f
   assert.ok(fieldTexts(content).some((t) => t.includes("Rejected by") && t.includes("<@U0APPROVER1>")));
 });
 
-test("message always includes request type, resource, duration, and status", () => {
+test("message always includes request type, resource, the historical duration fallback, and status", () => {
   const content = buildRequesterDecisionNotification(baseParams);
   const texts = fieldTexts(content);
   assert.ok(texts.some((t) => t.includes("Custom Request")));
   assert.ok(texts.some((t) => t.includes("AWS Test Resource")));
   assert.ok(texts.some((t) => t.includes("2 hours")));
   assert.ok(texts.some((t) => t.includes("APPROVED")));
+});
+
+test("a request with real M8 timing shows a 'When' field, not 'When / Duration'", () => {
+  const content = buildRequesterDecisionNotification({
+    ...baseParams,
+    timing: { startDate: "2026-09-19", startTime: null, endDate: null, endTime: null },
+    legacyDurationMinutes: null,
+  });
+  const texts = fieldTexts(content);
+  assert.ok(texts.some((t) => t.includes("*When:*") && t.includes("Sep 19, 2026")));
+  assert.ok(!texts.some((t) => t.includes("When / Duration")));
+});
+
+test("a request with no timing and no legacy duration shows no When field at all", () => {
+  const content = buildRequesterDecisionNotification({ ...baseParams, timing: NO_TIMING, legacyDurationMinutes: null });
+  const texts = fieldTexts(content);
+  assert.ok(!texts.some((t) => t.includes("When")));
 });
 
 // --- M7: decision comment/reason rendering ---

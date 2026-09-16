@@ -16,7 +16,6 @@ import {
 import { buildRequestModal, REQUEST_MODAL_CALLBACK_ID } from "@/lib/requests/build-request-modal";
 import { buildErrorView, buildRequestCenterView, buildRequestDetailsView, buildWaitingListView, type ModalView } from "@/lib/requests/build-requests-views";
 import { isFinalDecisionTransition } from "@/lib/requests/build-requester-decision-notification";
-import { formatDurationLabel } from "@/lib/requests/duration-options";
 import { notifyApprovers, type NotificationRecipient } from "@/lib/requests/notify-approvers";
 import { notifyRequesterOfDecision } from "@/lib/requests/notify-requester";
 import { parseApprovalBlockAction, type BlockActionsPayload } from "@/lib/requests/parse-block-action";
@@ -182,7 +181,15 @@ async function handleRequestSubmission(payload: ViewSubmissionPayload): Promise<
       // column stays nullable and unpopulated for new requests rather than
       // duplicating the Details text into it. See validate-request-submission.ts.
       reason: null,
-      requested_duration_minutes: result.data.requestedDurationMinutes,
+      // M8 correction: the fixed duration dropdown was replaced by the
+      // requested_start_date/time and requested_end_date/time columns below
+      // — this legacy column is retained only for historical rendering and
+      // is never populated by a new request.
+      requested_duration_minutes: null,
+      requested_start_date: result.data.timing.startDate,
+      requested_start_time: result.data.timing.startTime,
+      requested_end_date: result.data.timing.endDate,
+      requested_end_time: result.data.timing.endTime,
       status: "PENDING",
       idempotency_key: result.data.idempotencyKey,
       ...routingFields,
@@ -215,7 +222,7 @@ async function handleRequestSubmission(payload: ViewSubmissionPayload): Promise<
       requestTypeName: requestType.name,
       resource: result.data.resource,
       reason: null,
-      requestedDurationMinutes: result.data.requestedDurationMinutes,
+      timing: result.data.timing,
       requester: { slack_user_id: result.data.slackUserId, display_name: null },
       recipients,
     });
@@ -300,7 +307,9 @@ async function rebuildApprovalMessageContent(workspaceId: string, requestId: str
   const supabase = getSupabaseAdmin();
   const { data: request, error } = await supabase
     .from("requests")
-    .select("resource, reason, requested_duration_minutes, request_types(name), users!requests_requester_id_fkey(slack_user_id)")
+    .select(
+      "resource, reason, requested_duration_minutes, requested_start_date, requested_start_time, requested_end_date, requested_end_time, request_types(name), users!requests_requester_id_fkey(slack_user_id)",
+    )
     .eq("id", requestId)
     .eq("workspace_id", workspaceId)
     .maybeSingle();
@@ -318,7 +327,13 @@ async function rebuildApprovalMessageContent(workspaceId: string, requestId: str
     requester: { slack_user_id: requester?.slack_user_id ?? "unknown", display_name: null },
     resource: request.resource,
     reason: request.reason,
-    durationLabel: formatDurationLabel(request.requested_duration_minutes),
+    timing: {
+      startDate: request.requested_start_date,
+      startTime: request.requested_start_time,
+      endDate: request.requested_end_date,
+      endTime: request.requested_end_time,
+    },
+    legacyDurationMinutes: request.requested_duration_minutes,
   });
 }
 

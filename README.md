@@ -27,14 +27,19 @@ Appointment, Work From Home, Personal Time, Schedule Change, Expense /
 Purchase, and Other Request**, in place of the original AWS-flavored set
 (Production Access, Deployment Approval, Software Access, Purchase
 Approval, Custom Request). The request modal is now **Request Type /
-Details / When-Duration / Approver** — "Resource" and "Reason" (both
-inherited AWS-access language) are gone from the customer-facing UI, merged
-into a single **Details** field. "Duration" is now **When / Duration**,
-with options that actually fit workplace requests (30 minutes up to 1
-week) instead of an access-grant's minutes-to-hours scale. DIRECT
-(requester-picks-an-approver) routing remains the zero-config MVP default;
-the POLICY engine is untouched and still available as an advanced,
-optional capability — see [M8: MVP Simplification
+Details / Start date / Start time / End date / End time / Approver** —
+"Resource" and "Reason" (both inherited AWS-access language) are gone from
+the customer-facing UI, merged into a single **Details** field, and the
+original fixed "Duration" dropdown (30 minutes .. 1 week) has been replaced
+entirely by native Slack date/time pickers, because a dropdown could say "1
+week" but never *which* week. All four date/time fields are optional —
+some requests (e.g. Expense / Purchase) don't need timing at all — and are
+stored/shown as the literal local values the requester picked, with no
+timezone conversion of any kind. DIRECT (requester-picks-an-approver)
+routing remains the zero-config MVP default; the POLICY engine is untouched
+and still available as an advanced, optional capability; legacy technical
+request types remain in the database for historical rendering but are
+deactivated for new request creation — see [M8: MVP Simplification
 architecture](#m8-mvp-simplification-architecture) below. **Not yet
 deployed** — pending migration review.
 
@@ -1550,7 +1555,7 @@ every workspace was preferred.
 
 ### Migrations
 
-Two new, additive migrations — neither edits a historical migration file:
+Three additive migrations — none edits a historical migration file:
 
 - **`20260916000000_relax_requests_reason_not_null.sql`** —
   `ALTER TABLE requests ALTER COLUMN reason DROP NOT NULL`. The existing
@@ -1565,6 +1570,14 @@ Two new, additive migrations — neither edits a historical migration file:
   the 5 legacy keys, global (not scoped to one `workspace_id`) because no
   workspace will ever be seeded with those keys again — any row with one of
   them is by definition a pre-M8 install.
+- **`20260916010000_add_request_timing_fields.sql`** — adds
+  `requested_start_date`/`requested_start_time`/`requested_end_date`/
+  `requested_end_time` (nullable `date`/`time` columns) plus 5 CHECK
+  constraints mirroring `validateRequestTiming()` exactly (see [Start/end
+  date and time, not a duration dropdown](#startend-date-and-time-not-a-duration-dropdown)
+  below). All 5 are immediately valid (not `NOT VALID`) — these are
+  brand-new columns, so every existing row has `NULL` in all four,
+  trivially satisfying every condition.
 
 ### Details vs. Resource — why the column was never renamed
 
@@ -1591,40 +1604,110 @@ pre-M8 historical request, absent for every new one. No fabricated
 placeholder ever appears, matching the pattern M7 already established for
 optional decision comments.
 
-### When / Duration: still a fixed list, not a calendar
+### Start/end date and time, not a duration dropdown
 
-The original duration options (30 minutes .. 8 hours .. 1 day) were shaped
-around temporary infrastructure access grants. Workplace requests routinely
-span multiple days (a week of vacation, a half-day appointment), which that
-scale had no way to express, so M8 replaces the list with: 30 minutes, 1
-hour, 2 hours, Half day, 1 day, 2 days, 3 days, 1 week, and "Other / Not
-specified" (`requested_duration_minutes = NULL`, same nullable column and
-`resolveDurationMinutes`/`formatDurationLabel` functions as before — only
-the option list changed). This is still a fixed Block Kit `static_select`,
-exactly like before — no calendar widget, no date-range picker, no
-business-day math, no PTO balance, no automatic expiration. A request for
-"Sep 21–25" is still expressed as selecting "1 week" (or "Other / Not
-specified" and describing the exact dates in Details) — deliberately a
-coarse, descriptive field, not structured HR data. A free-text "When"
-field was considered and rejected: a fixed list keeps `requested_duration_minutes`
-a real, queryable, comparable integer (already used by `formatDurationLabel`
-for display and by historical requests) rather than an unstructured string
-with no computable value at all.
+M8's first pass replaced "Duration" with a fixed dropdown offering coarser
+workplace-shaped options (30 minutes .. 1 week). Real Slack testing
+immediately exposed why that's still wrong: "Vacation / Time Off, 1 week"
+doesn't say *which* week, and "Doctor Appointment, 2 hours" doesn't say
+*when* the appointment is. A duration — however coarse — can never answer
+"when," because it isn't an instant or a date, only a span.
+
+The corrected design drops the dropdown entirely and captures the actual
+dates/times via four independent, optional fields, each a native Slack
+Block Kit element:
+
+| Field | Element | Optional |
+| --- | --- | --- |
+| Start date | `datepicker` | yes |
+| Start time | `timepicker` | yes |
+| End date | `datepicker` | yes |
+| End time | `timepicker` | yes |
+
+All four are stored as literal local values — a `date` string
+("2026-09-21") and a `time` string ("10:00") — exactly as the requester
+picked them, in `requested_start_date`/`requested_start_time`/
+`requested_end_date`/`requested_end_time`. **ApproveFlow performs no
+timezone conversion of any kind, on read or write.** This app has no
+reliable per-employee or per-workspace timezone model, so DATE/TIME
+(not `timestamptz`) was a deliberate choice: storing an absolute instant
+would require silently picking a timezone (almost certainly the server's,
+UTC) to convert into, which risks misrepresenting what the requester
+actually meant. A `date`/`time` pair makes no such claim — it's just the
+human value as entered.
+
+All four fields are optional independently, because not every request
+needs timing at all — "Expense / Purchase" routinely has none. Business
+rules (never invented, only rejected when nonsensical) are enforced
+identically in the Slack modal's own validation and in a 5-constraint
+CHECK-constraint backstop at the database level (see [Migrations](#migrations)
+above and [Request Details](#request-details) below for how "nothing
+supplied" renders): a start time needs a start date; an end date needs a
+start date; an end time needs an end date; the end date can't be before
+the start date; and when start and end land on the exact same calendar
+date with both times present, the end time must be strictly after the
+start time. Critically, a same-day or multi-day range is never rejected
+just because *one side's* time was left blank — only ever having both a
+date pair and both times, with the times in the wrong order, is invalid.
+
+No calendar integration, no PTO balance, no leave accrual, no
+business-day math, and no automatic expiration exist anywhere in this
+design — these are still four plain, independent form fields, not a
+scheduling system.
 
 ### Request modal: final field layout
 
-**Request Type → Details → When / Duration → Approver.** The native Slack
-`users_select` approver picker is unchanged and still required — M8 doesn't
-touch approver selection, org-chart lookup, or manager directories at all.
-DIRECT routing (the requester's selected approver) remains the zero-config
-default; if an active POLICY exists for the selected request type, M4's
-routing precedence is completely unchanged — POLICY still overrides the
-manually selected approver, exactly as it always has. None of the 7 new
-default types has a policy configured anywhere, so all of them route
-DIRECT out of the box; policies remain available as an explicit, optional,
+**Request Type → Details → Start date → Start time → End date → End time →
+Approver.** The native Slack `users_select` approver picker is unchanged
+and still required — M8 doesn't touch approver selection, org-chart
+lookup, or manager directories at all, and its former hint text explaining
+policy-vs-manual routing (an internal implementation detail) was removed —
+ordinary employees don't need to know or think about it. DIRECT routing
+(the requester's selected approver) remains the zero-config default; if an
+active POLICY exists for the selected request type, M4's routing
+precedence is completely unchanged — POLICY still overrides the manually
+selected approver, exactly as it always has. None of the 7 new default
+types has a policy configured anywhere, so all of them route DIRECT out of
+the box; policies remain available as an explicit, optional,
 script-configured capability (see [Approval policy
 configuration](#approval-policy-configuration-optional-m3) above) for
 whoever wants that on top.
+
+### The shared timing formatter, and the historical duration fallback
+
+One function, `formatWhenLabel()` (`src/lib/requests/request-timing.ts`),
+is the single source of truth for rendering request timing everywhere it
+appears — Request Details, the approver DM, the requester notification,
+and App Home/Request Center row summaries all call the exact same
+function, never reimplementing the logic per surface. It prefers the new
+date/time fields when any are set, rendering a single date ("Sep 19,
+2026"), a date range ("Sep 21, 2026 – Sep 25, 2026"), same-day times
+("Sep 18, 2026, 10:00 – 12:00"), or a full multi-day range with times
+("Sep 21, 2026, 09:00 – Sep 25, 2026, 17:00") — labeled **"When"**. A
+partial time (only a start or only an end time supplied) is still shown,
+never silently dropped or invented on the other side. When none of the
+four new fields are set at all, it falls back to the historical
+`requested_duration_minutes` value (every one of the 16 pre-correction
+requests, plus any brand-new request where the requester left every timing
+field blank) — labeled **"When / Duration"**, a deliberately different
+label so a reader can never mistake a historical duration figure for a
+real date. When there is truly nothing to show (a new request with no
+timing and no legacy duration, e.g. most "Expense / Purchase" requests),
+the field is omitted entirely — never "Not specified," "NULL," "0
+minutes," or "undefined."
+
+`requested_duration_minutes` itself is untouched and permanently retained
+for this historical fallback — new requests always leave it `NULL`. The
+historical label lookup table (`DURATION_OPTIONS` in
+`duration-options.ts`) must always reflect the *original* M2–M7 scale
+(30 minutes .. 1 day) actually offered to real users at the time — not
+any later, short-lived option list — since production data already
+proved why that matters: one real historical request has
+`requested_duration_minutes = 240`, selected as "4 hours" under the
+original scale. M8's first pass briefly relabeled 240 as "Half day" in a
+newer (and quickly discarded) option list, which would have silently
+misrepresented that request's own history. That request correctly shows
+"4 hours" again.
 
 ### An incidental bug found and fixed while adding modal tests
 
@@ -1641,53 +1724,72 @@ fix — zero behavior change, confirmed by an unchanged build output.
 
 ## M8 end-to-end testing procedure (prepared, not yet executed — pending migration review)
 
-Needs both M8 migrations reviewed and pushed (`pnpm dlx supabase db push`,
-not run by me).
+Needs all three M8 migrations reviewed and pushed
+(`pnpm dlx supabase db push`, not run by me).
 
-### Test A — fresh-workspace zero-config journey
+### Test A — existing workspace upgrade: date range (Vacation / Time Off)
 
-Cannot be run against the existing production ("Lord of the Rings")
-workspace without installing ApproveFlow into a genuinely separate Slack
-workspace — not performed as part of this milestone's implementation. When
-ready to verify:
+1. Open App Home → **Create Request**. On first open, Request Type must
+   show exactly the 7 new workplace types — none of the 5 legacy ones.
+   Confirm the field order: Request Type, Details, Start date, Start time,
+   End date, End time, Approver — no Resource, no Reason, no duration
+   dropdown, no policy-routing hint under Approver.
+2. Type: "Vacation / Time Off", Details: "M8 Vacation Test", Start date: a
+   future date, Start time: left blank, End date: a few days later, End
+   time: left blank, Approver: the other test account. Submit.
+3. Verify the approver's DM shows `Details: M8 Vacation Test` and
+   `When: <start date>, 2026 – <end date>, 2026` (no times, since none were
+   given), and routes DIRECT.
+4. Approver approves with "Approved for M8 E2E". Verify: request APPROVED,
+   Request Details shows the correct date range, the requester notification
+   shows the same range and the M7 comment, and no "Duration" terminology
+   appears anywhere for this new request.
 
-1. Install ApproveFlow into a brand-new Slack workspace (no prior
-   ApproveFlow history at all).
-2. Open the App Home tab → intro copy shows the new workplace-approvals
-   description, "Create Request" is the only top-level button, "My
-   Requests"/"Waiting for Me" both show their empty states.
-3. Click **Create Request** → the modal opens with **Request Type**
-   showing exactly the 7 new workplace types (no admin step, no script, no
-   dashboard visit) → **Details** → **When / Duration** → **Approver**.
-4. Fill in any type (e.g. "Vacation / Time Off"), Details ("Test vacation
-   request"), When/Duration ("1 week"), and select a second account as
-   Approver → Submit.
-5. Verify the approver receives a DM with **Details**/**When / Duration**
-   fields (no "Resource", no "Reason" line since none was collected) and
-   Approve/Reject buttons.
-6. Approver clicks Approve (via the M7 decision modal) → requester is
-   notified, using the same **Details**/**When / Duration** terminology.
-7. Confirm in the database: `routing_type = 'DIRECT'`, `reason IS NULL`,
-   `request_type_id` resolves to one of the 7 new keys — no policy
-   configuration exists anywhere for that workspace.
+### Test B — Doctor Appointment with times, same day
 
-### Test B — existing production workspace, post-migration
+1. Create "Doctor Appointment", Details: "M8 Dentist Test", Start
+   date/time: one future date / "10:00", End date: the same date, End
+   time: "12:00", Approver: the other account. Submit.
+2. Verify `When: <date>, 2026, 10:00 – 12:00` renders identically in
+   Request Details, the approver's view, and the requester's final
+   notification once decided.
 
-1. Open App Home / run `/request` in the existing workspace → Request Type
-   shows only the 7 new types — none of the 5 legacy ones appear.
-2. Open a pre-M8 historical request in Request Details (e.g. a `Custom
-   Request` or `Production Access` one) → still renders correctly,
-   including its original **Reason** line (non-null, pre-M8 data) and
-   correct historical routing/decision information.
-3. Confirm the existing "Production Access Approval" policy is still
-   `active = true` in the database and its members are unchanged — it is
-   simply unreachable from new request creation now, not broken.
+### Test C — no timing at all (Expense / Purchase)
 
-### Test C — regression
+1. Create "Expense / Purchase", Details: "M8 Monitor Test", leave all four
+   timing fields blank, Approver: the other account. Submit.
+2. Verify: succeeds, no "When" field appears anywhere, never "Not
+   specified"/"0 minutes"/a malformed value. Safe to leave PENDING.
 
-Run through one full DIRECT approve-with-comment cycle (M7's Test A) using
-a new MVP request type, to confirm the M3–M7 decision/notification pipeline
-is completely unaffected by the M8 vocabulary/default changes.
+### Test D — validation
+
+1. Open another Create Request. Enter a start date, then an *earlier* end
+   date. Submit → Slack must block submission with a clear field error, no
+   request created.
+2. Same start/end date, start time "10:00", end time "09:00". Submit →
+   must be rejected with a clear field error (end time must be after start
+   time). Confirm a same-day request with only one of the two times filled
+   in is **not** rejected — only a fully-specified, wrongly-ordered pair is
+   invalid.
+
+### Test E — historical compatibility
+
+1. Open an old historical Production Access request → still opens, still
+   says "Production Access", its original Reason still renders, its
+   policy/approval history renders correctly.
+2. Specifically locate the historical request with a 240-minute duration —
+   it must display **"4 hours"**, never "Half day".
+3. Confirm the "Production Access Approval" policy is still `active = true`
+   with its members unchanged — simply unreachable from new request
+   creation.
+
+### Fresh-workspace zero-config journey (separate — after the above)
+
+Cannot be run against the existing production workspace; requires
+installing ApproveFlow into a genuinely separate Slack workspace. Install →
+open Home → Create Request → confirm all 7 defaults appear immediately
+with zero SQL/script/manual Supabase setup → submit a DIRECT request →
+approver decides → requester notified.
 
 ## Project structure
 
@@ -1725,15 +1827,17 @@ src/
       parse-slack-event.ts        # pure (M6): Events API envelope classifier — url_verification / app_home_opened / ignored (unit tested)
       parse-slack-event.test.ts
     requests/
-      duration-options.ts         # pure: shared "When / Duration" select options + labels (M8: workplace-shaped range, unit tested)
+      duration-options.ts         # pure: HISTORICAL-ONLY duration label lookup (M8 correction: original M2-M7 scale only, unit tested)
       duration-options.test.ts
+      request-timing.ts           # pure (M8 correction): start/end date+time validation + the one shared "When" formatter (unit tested)
+      request-timing.test.ts
       request-types.ts            # server-only: default request types + idempotent seeding (M8: 7 workplace types replace the original 5)
       workspace-lookup.ts         # server-only: workspace/user lookup+upsert
-      build-request-modal.ts      # pure: Block Kit modal builder — Request Type / Details / When-Duration / Approver (M8; unit tested)
+      build-request-modal.ts      # pure: Block Kit modal builder — Request Type / Details / Start+End date+time / Approver (M8 correction; unit tested)
       build-request-modal.test.ts
-      validate-request-submission.ts  # pure: view_submission validation (unit tested; M8: no separate Reason field)
+      validate-request-submission.ts  # pure: view_submission validation (unit tested; M8: no separate Reason field; M8 correction: date/time fields, not a duration dropdown)
       validate-request-submission.test.ts
-      build-approval-notification.ts  # pure: approver DM builder, message update, outcome text (M8: Details/When-Duration terminology, optional Reason)
+      build-approval-notification.ts  # pure: approver DM builder, message update, outcome text (M8: Details terminology, optional Reason; M8 correction: When timing)
       parse-block-action.ts       # pure: block_actions (Approve/Reject) validation — message- and modal-origin (unit tested; M7: now also requires trigger_id)
       parse-block-action.test.ts
       build-decision-modal.ts     # pure (M7): Approve/Reject decision modal builder — optional Comment / required Reason (unit tested)
@@ -1785,4 +1889,5 @@ supabase/
     *_update_decide_on_request_for_comment_validation.sql  # M7 — deployed
     *_relax_requests_reason_not_null.sql            # M8 — NOT YET PUSHED, pending review
     *_deactivate_legacy_request_types.sql           # M8 — NOT YET PUSHED, pending review
+    *_add_request_timing_fields.sql                 # M8 correction — NOT YET PUSHED, pending review
 ```
