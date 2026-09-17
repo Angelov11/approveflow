@@ -18,24 +18,54 @@ An earlier direction (see "Previously" below) explored positioning this as
 an AWS-access-request tool; M8 deliberately narrowed the MVP to this
 simpler, more universal workplace-approvals scope instead.
 
-## Current milestone: M8.1 — Slack Production Hardening
+## Current milestone: M9 — Workspace Administration & Approval Policy Management
 
-M8.1 doesn't change the product surface at all — no new fields, no new
-request types, no UI changes anywhere. It hardens three things the M8 field
-matrix's own production E2E testing exposed as real gaps: (1) several Slack
-interaction handlers did more synchronous work before acknowledging Slack
-than the ~3 second interactivity window comfortably allows, occasionally
-making an action look like it silently failed; (2) there was no structured
-timing data anywhere to see *why*, only ad-hoc `console.error` strings on
-failure paths; and (3) `workspaces` had no concept of "uninstalled" at all —
-Slack's `app_uninstalled`/`tokens_revoked` events (now subscribed) were
-silently ignored. See [M8.1: Slack Production
+M9 answers a question the product had never actually addressed: *who* is
+allowed to configure ApproveFlow for a workspace? Every prior milestone
+treated every Slack user identically. M9 adds a minimal administration
+model — explicit **ADMIN** grants only, no separate MEMBER role, no
+organizations/teams/departments — and exposes the existing (unchanged)
+M3/M4 approval-policy engine through Slack-native "Manage Approval
+Policies"/"Manage Administrators" surfaces on the App Home tab, visible
+only to admins. The first person to install ApproveFlow into a workspace
+becomes its initial admin automatically, identified from Slack's own
+`authed_user.id` (never the bot's own identity, never a client-supplied
+value); a *reinstall* of an already-known workspace never grants admin
+again, no matter who performs it. See [M9: Workspace Administration &
+Approval Policy Management](#m9-workspace-administration--approval-policy-management)
+below for the full design, including the atomic install/bootstrap RPC, the
+last-admin-removal race protection, and how the Create Request modal now
+hides the Approver picker entirely once a policy governs the selected
+type. **Migration deployed and dynamically verified against production
+using synthetic test data — application code not yet committed.** The
+real, pre-M9 production workspace ("Lord of the Rings") has already been
+bootstrapped with its first admin via the one-off legacy script (see
+below); a real SQL bug caught during this verification —
+`install_or_reinstall_workspace`/`configure_approval_policy` bare column
+references colliding with `RETURNS TABLE` output parameter names — was
+fixed via a small additive corrective migration, never by editing the
+already-applied one. See [M9: Workspace Administration & Approval Policy
+Management](#m9-workspace-administration--approval-policy-management)
+below for the full design and verification results.
+
+## Previously: M8.1 — Slack Production Hardening
+
+M8.1 didn't change the product surface at all — no new fields, no new
+request types, no UI changes anywhere. It hardened three things the M8
+field matrix's own production E2E testing exposed as real gaps: (1)
+several Slack interaction handlers did more synchronous work before
+acknowledging Slack than the ~3 second interactivity window comfortably
+allows, occasionally making an action look like it silently failed; (2)
+there was no structured timing data anywhere to see *why*, only ad-hoc
+`console.error` strings on failure paths; and (3) `workspaces` had no
+concept of "uninstalled" at all — Slack's `app_uninstalled`/`tokens_revoked`
+events (now subscribed) were silently ignored. See [M8.1: Slack Production
 Hardening](#m81-slack-production-hardening) below for the full design:
-which work now happens via `next/server`'s `after()` instead of blocking
-the response, the new workspace installation lifecycle
+which work runs via `next/server`'s `after()` instead of blocking the
+response, the workspace installation lifecycle
 (`INSTALLED`/`TOKEN_REVOKED`/`UNINSTALLED`), and the minimal structured
-latency instrumentation added alongside it. **Implemented and locally
-verified — not yet deployed** (migration not yet pushed, nothing committed).
+latency instrumentation added alongside it. **Deployed and
+production-verified** (`679c0c7`).
 
 ## Previously: M8 — MVP Product Simplification
 
@@ -462,9 +492,15 @@ requesters pick an approver directly in the modal. Configure a policy only
 if you want a request type to always route to a fixed set of approvers
 regardless of who submits it, or to require more than one approval.
 
-There's no admin UI yet. Policies and their approvers are configured with a
-one-off script run locally against your Supabase project — not an HTTP
-endpoint, so there's nothing for an unauthenticated caller to hit:
+**As of M9, this is also available Slack-natively** — an ApproveFlow admin
+can open App Home → Administration → "Manage Approval Policies" and
+configure/edit/disable a policy for any of the 7 active request types
+without touching a terminal at all (see [M9: Workspace Administration &
+Approval Policy
+Management](#m9-workspace-administration--approval-policy-management)
+below). The script below remains fully functional and is still the only
+option for a pre-M9 workspace that has no admin configured yet — not an
+HTTP endpoint, so there's nothing for an unauthenticated caller to hit:
 
 ```bash
 node --experimental-strip-types --env-file=.env.local \
@@ -1602,7 +1638,7 @@ Four additive migrations — none edits a historical migration file:
   below). All 5 are immediately valid (not `NOT VALID`) — these are
   brand-new columns, so every existing row has `NULL` in all four,
   trivially satisfying every condition.
-- **`20260916020000_add_request_expense_fields.sql`** (not yet pushed) —
+- **`20260916020000_add_request_expense_fields.sql`** — deployed —
   adds `requested_amount numeric(10,2)` and `requested_currency text`
   (both nullable) plus two CHECK constraints, `requests_amount_positive`
   (`requested_amount IS NULL OR requested_amount > 0`) and
@@ -2358,19 +2394,16 @@ types/policies — is reused exactly as it was before M8.1.
 
 One new additive migration —
 `supabase/migrations/20260917000000_add_workspace_installation_lifecycle.sql`
-— not yet pushed. None of the prior M1–M8 migration files are edited.
+— deployed. None of the prior M1–M8 migration files are edited.
 Adds `installation_status text not null default 'INSTALLED' check (...)`
-(the default backfills the current production workspace correctly with no
-separate `UPDATE`, since it genuinely is installed today), `uninstalled_at
-timestamptz null`, and relaxes `NOT NULL` on the three
+(the default backfilled the then-current production workspace correctly
+with no separate `UPDATE`, since it genuinely was installed at the time),
+`uninstalled_at timestamptz null`, and relaxes `NOT NULL` on the three
 `bot_access_token_*` columns. See the migration file's own header comment
 for the full reasoning, including why `first_installed_at`, an index, and a
 lifecycle RPC were all deliberately left out of this milestone.
 
-## M8.1 end-to-end testing procedure (prepared, not yet executed — pending migration review)
-
-Needs the new lifecycle migration reviewed and pushed
-(`pnpm dlx supabase db push`, not run automatically).
+## M8.1 end-to-end testing procedure (migration deployed and DB-verified; manual Slack UX walkthrough below not yet executed)
 
 ### Test A — responsiveness: request-type switching feels instant
 
@@ -2421,6 +2454,222 @@ trigger this deliberately, this test is deferred — the same conservative
 matching logic is already exhaustively unit tested in
 `compute-installation-transition.test.ts`.
 
+## M9: Workspace Administration & Approval Policy Management
+
+### The model: explicit ADMIN grants only
+
+`workspace_admins` (workspace_id, user_id, granted_at, granted_by) is the
+entire administration model — a row means ADMIN, absence means normal
+user. There is no MEMBER table, no role column on `users`, and nothing
+resembling an organization/team/department hierarchy: every `users` row
+that was ever going to exist for interaction-history purposes already
+does, unchanged, and admin status is a separate, minimal overlay on top of
+it. Billing (FREE/PRO, a BILLING_ADMIN concept) is explicitly a different,
+future concern — nothing here assumes or blocks it.
+
+### First install: the installer becomes admin, atomically
+
+Slack's `oauth.v2.access` response includes `authed_user.id` — the Slack
+user ID of the human who completed the OAuth authorization — even for a
+bot-scopes-only install with no `user_scope` requested (verified directly
+against current Slack documentation, not assumed from field naming; see
+the M9 audit for the exact response shape). This is categorically
+different from `bot_user_id`, which identifies the app's own bot account
+and must never be treated as a person. The OAuth callback passes
+`authed_user.id` into one RPC, `install_or_reinstall_workspace(...)`,
+which — for a genuinely brand-new workspace only — inserts the workspace
+row, upserts a `users` row for that installer, and grants them admin
+(`granted_by = null`, meaning "bootstrapped at install"), all in the same
+transaction. No separate follow-up call exists that could leave a
+workspace permanently adminless if a process crashed between two steps.
+
+**Reinstalling** an already-known workspace — regardless of whether it was
+previously `INSTALLED`, `UNINSTALLED`, or `TOKEN_REVOKED` — only updates
+Slack installation/token fields; `workspace_admins` is never read or
+written in that branch. The person performing a reinstall never gains
+admin merely by doing so. New-vs-existing detection deliberately does
+**not** read Postgres's `xmax` system column as an application-level
+signal (an MVCC implementation detail); it uses a fully standard,
+documented technique instead — `INSERT ... ON CONFLICT (slack_team_id) DO
+NOTHING RETURNING id` is itself a single atomic statement, and "did this
+insert hand back a row" is the entire signal. See the migration file's own
+header comment for the full reasoning.
+
+### Last-admin protection
+
+A workspace can never go from 1 admin to 0. `remove_workspace_admin(...)`
+serializes concurrent removal attempts by locking the **parent
+`workspaces` row** (`select id from workspaces where id = $1 for update`)
+rather than the `workspace_admins` row set directly — the same
+`FOR UPDATE` row-locking technique `decide_on_request()` already uses,
+applied to a different invariant. This closes the specific race two admins
+removing each other simultaneously could otherwise cause: whichever
+transaction commits first leaves exactly one admin; the second transaction
+re-counts *after* acquiring the lock and correctly refuses
+(`last_admin`) rather than reaching zero.
+
+### Centralized authorization
+
+`isWorkspaceAdmin(workspaceId, slackUserId)`
+(`src/lib/requests/workspace-admins.ts`) is the single check every
+administrative action calls — resolved from the signed Slack payload's
+`team`/`user` fields plus server-side `workspace_admins` state, never from
+Slack UI visibility or a modal's `private_metadata`. Hiding the
+Administration buttons from non-admins in App Home is a UX convenience
+only; every handler behind them re-authorizes independently regardless.
+
+### Legacy (pre-M9) workspaces
+
+The one workspace that existed before M9 had no admin at all, and its true
+original installer's identity was never captured (M8.1 and earlier never
+read `authed_user.id`). Making every existing user an admin, or waiting
+for a future reinstall to somehow retrofit one, were both rejected —
+see the M9 audit. Instead, `scripts/bootstrap-workspace-admin.ts` (the
+same one-off-script convention already used for
+`configure-approval-policy.ts`) grants a specific, operator-named Slack
+user admin for a specific team, explicitly and idempotently — never baked
+into source code or a migration. **Run once against production**, after
+independently re-verifying every identity claim server-side first (the
+named team ID actually resolves to the expected workspace, the named admin
+ID is a known human user distinct from `bot_user_id`, and the workspace
+had zero existing admin grants) rather than trusting the operator's stated
+IDs outright: `node --experimental-strip-types --env-file=.env.local
+scripts/bootstrap-workspace-admin.ts --team T043HBQKHS4 --admin
+U042D3ZND0X`. Confirmed afterward: exactly one `workspace_admins` row,
+`granted_by = null`, and the workspace's installation fields/token/history
+completely untouched (the script never writes to `workspaces` at all).
+
+### Approval policy management, exposing the unchanged M3/M4 engine
+
+M9 does not modify `approval_policies`/`approval_policy_members` or
+`decide_on_request()` at all — it only adds a Slack-native way to write to
+tables that previously required a local script. "Manage Approval Policies"
+lists the 7 active workplace request types, each showing either "No
+policy — employees choose an approver" or the current policy's approvers
+(as `<@id>` mentions — no `users:read` scope, no name storage) and
+required-approval count. "Configure"/"Edit" opens one modal per type:
+`multi_users_select` for approvers, a `static_select` for required
+approvals (1–10), and an Active/Disabled status — reusing the exact same
+combined modal for creating, editing, and disabling, since adding a
+separate quick-disable action wasn't needed to keep it simple. Disabling a
+policy is always `active = false`; nothing is ever hard-deleted, matching
+`request_types.active`'s established convention. All of this is written
+atomically through one RPC, `configure_approval_policy(...)`, which
+enforces the request-type/workspace relationship, rejects a threshold
+above the approver count, rejects duplicate approvers, and atomically
+replaces the entire membership set — replacing the previous multi-step,
+non-atomic sequence `scripts/configure-approval-policy.ts` used by hand.
+**Found and fixed during implementation:** the first draft of this RPC's
+"find the existing policy to edit" lookup filtered on `active = true`,
+which would have silently created a second policy row every time an admin
+re-enabled a previously-disabled policy — fixed to match on
+`(workspace_id, request_type_id)` regardless of status, so there is always
+at most one policy row per type going forward.
+
+### Policy edit semantics — unchanged from M4, by design
+
+Editing a policy's approvers or threshold **never** touches
+already-created requests: `routing_type`, `approval_policy_id`, and
+`required_approval_count` are frozen on the request row at creation
+(unchanged M4 behavior), while *membership* stays live — a request
+governed by a policy always resolves who may currently decide it from
+`approval_policy_members` fresh, so removing someone as an approver takes
+effect immediately even for a request already in flight. The policy
+configuration modal includes a standing reminder: "Changing approvers
+affects pending requests already using this policy." No pending request is
+ever rewritten.
+
+### Create Request: no more meaningless manual Approver field
+
+Before M9, the Create Request modal always showed a "Approver" picker even
+when an active policy would silently discard whatever was selected. Now,
+whenever the currently-selected request type has an active policy, the
+picker is replaced by a read-only line — "Automatically routed according
+to workspace policy. `<@Gary>` `<@Finance>` — 2 approvals required" — and
+when it doesn't, the picker still appears exactly as before. This adds
+**no** new sequential database round trip to the `trigger_id`-bound modal-open
+paths: since Request Type is a required field with no default selection,
+every real submission necessarily fires at least one
+`dispatch_action`-triggered rebuild first (already running inside
+`after()` since M8.1, with no ack-window budget to protect), which is the
+only place the active-policy lookup happens.
+
+Submission itself **never** trusts what the modal displayed. The
+interactions route re-checks the active policy fresh, right before
+deciding routing, via one small pure function,
+`computeRequestRoutingDecision(hasActivePolicy, selectedApproverSlackId)`
+(exhaustively unit tested): an active policy always wins regardless of
+whatever a stale modal happened to collect; no active policy requires a
+selected approver, and a submission missing one — because the modal was
+built believing a policy was still active, which changed before the
+requester submitted — is rejected with a friendly "please reopen Create
+Request" error rather than ever guessing or fabricating an approver.
+
+### App Home
+
+`app_home_opened` already ACKs immediately and does its DB reads +
+`views.publish` inside `after()` (M8.1) — `isWorkspaceAdmin` is resolved
+there too, in the same `Promise.all` as the existing request queries, so
+this adds no new latency-critical stage. Admins see an extra
+**Administration** section (Manage Approval Policies, Manage
+Administrators); everyone else sees exactly the Home tab that existed
+before M9.
+
+### Migration and RPCs — deployed and dynamically verified
+
+Two additive migrations — none of the 16 pre-M9 migrations are touched:
+
+- `supabase/migrations/20260918000000_add_workspace_admin_model.sql` — adds
+  the `workspace_admins` table and three `SECURITY DEFINER` functions
+  (`install_or_reinstall_workspace`, `remove_workspace_admin`,
+  `configure_approval_policy`), each with a pinned `search_path`, `EXECUTE`
+  revoked from `public`/`anon`/`authenticated`, and granted only to
+  `service_role` — the same posture `decide_on_request()` already
+  established.
+- `supabase/migrations/20260918010000_fix_workspace_admin_rpc_column_ambiguity.sql`
+  — a corrective migration, found necessary during controlled verification
+  against the linked production database (local Docker/Supabase testing
+  wasn't completable in this environment, so the first migration's RPCs
+  were deployed on static review alone, then exercised directly against
+  production with synthetic data before any real workspace was touched).
+  `install_or_reinstall_workspace`'s `RETURNS TABLE (workspace_id uuid,
+  is_new_workspace boolean)` implicitly declares `workspace_id` as a
+  PL/pgSQL variable for the whole function body — its two `INSERT ... ON
+  CONFLICT (workspace_id, ...)` clauses then bare-reference `workspace_id`
+  in a context Postgres can't resolve between "the OUT parameter" and "the
+  table column," raising `42702: column reference "workspace_id" is
+  ambiguous` (`ON CONFLICT` target lists can't be table-qualified, so
+  qualifying wasn't an option). The exact same class of bug existed once
+  more in `configure_approval_policy`'s `DELETE ... WHERE policy_id =
+  v_policy_id`. `remove_workspace_admin` was re-audited line by line and
+  has no such collision anywhere in its body. Fixed by adding
+  `#variable_conflict use_column` as the first line of the two affected
+  function bodies (`CREATE OR REPLACE FUNCTION` with an identical
+  signature, preserving grants) — the correct choice here specifically
+  because neither function ever actually reads its own implicit OUT
+  variables; both always populate their result via a distinctly-named
+  local variable instead. **The already-applied first migration file was
+  never edited** — this is a second, additive migration, matching this
+  project's established discipline for every prior milestone.
+
+Both migrations, and the full RPC behavior, have been dynamically verified
+directly against the linked production database using synthetic
+`T_M9_RPC_TEST_*` data (a temporary workspace, users, request type, and
+policy — fully cleaned up afterward via cascade delete, verified zero
+residue): first install, reinstall from `INSTALLED`/`TOKEN_REVOKED`/
+`UNINSTALLED`, `remove_workspace_admin`'s `removed`/`last_admin`/
+`not_admin`/`workspace_not_found` outcomes, and
+`configure_approval_policy`'s create/edit/disable/re-enable cycle (the
+re-enable case is the exact scenario the earlier "found and fixed during
+implementation" active-only lookup bug would have broken) plus every
+validation rejection path. Genuinely concurrent execution (two truly
+simultaneous first-install or removal attempts) was **not** dynamically
+exercised — this environment's available tooling issues one SQL statement
+at a time, and building new infrastructure just to prove it wasn't
+warranted; the concurrency guarantee rests on Postgres's own documented
+`INSERT ... ON CONFLICT` and row-locking semantics at the default `READ
+COMMITTED` isolation level, not on anything project-specific.
+
 ## Project structure
 
 ```
@@ -2430,12 +2679,12 @@ src/
       health/route.ts              # GET /api/health
       slack/
         install/route.ts           # GET /api/slack/install — starts OAuth
-        oauth/callback/route.ts    # GET /api/slack/oauth/callback
+        oauth/callback/route.ts    # GET /api/slack/oauth/callback (M9: calls install_or_reinstall_workspace() with authed_user.id)
         commands/
           request/route.ts         # POST /api/slack/commands/request — /request slash command
           requests/route.ts        # POST /api/slack/commands/requests — /requests slash command (M5)
-        events/route.ts            # POST /api/slack/events — Events API: url_verification, app_home_opened, app_uninstalled, tokens_revoked (M6; extended M8.1); ACKs immediately, all DB/Slack work via after()
-        interactions/route.ts      # POST /api/slack/interactions — modal submissions, Approve/Reject, /requests + Home navigation (M8.1: after() for non-trigger_id work, latency instrumentation)
+        events/route.ts            # POST /api/slack/events — Events API: url_verification, app_home_opened, app_uninstalled, tokens_revoked (M6; extended M8.1); ACKs immediately, all DB/Slack work via after(); M9: resolves isWorkspaceAdmin for Home in the same deferred batch
+        interactions/route.ts      # POST /api/slack/interactions — modal submissions, Approve/Reject, /requests + Home navigation (M8.1: after() for non-trigger_id work, latency instrumentation); M9: policy-aware routing + dispatches to admin-interaction-handlers.ts
     slack/installed/page.tsx       # OAuth result page
     page.tsx                       # home page (Add to Slack button)
     layout.tsx
@@ -2474,9 +2723,26 @@ src/
       compute-installation-transition.ts  # pure (M8.1): app_uninstalled/tokens_revoked lifecycle transition rules (unit tested, no SQL mirror needed — see file header)
       compute-installation-transition.test.ts
       workspace-lookup.ts         # server-only: workspace/user lookup+upsert; M8.1: + getUsableInstallation() centralized guard
-      build-request-modal.ts      # pure: request-type-aware Block Kit modal builder, dynamically shaped per TimingMode/expense (M8 field-matrix correction; unit tested)
+      is-bot-admin-candidate.ts   # pure (M9): the workspace's own bot must never become an admin (unit tested)
+      is-bot-admin-candidate.test.ts
+      workspace-admins.ts         # server-only (M9): isWorkspaceAdmin/listWorkspaceAdmins/grantWorkspaceAdmin/removeWorkspaceAdmin — centralized admin authorization + mutation
+      compute-admin-removal-outcome.ts  # pure (M9): mirror of remove_workspace_admin()'s outcome logic (unit tested; atomicity itself lives only in the RPC's row lock)
+      compute-admin-removal-outcome.test.ts
+      compute-request-routing.ts  # pure (M9): DIRECT vs POLICY vs rejected-stale-modal decision at final submission (unit tested)
+      compute-request-routing.test.ts
+      policy-configuration.ts     # server-only (M9): configure_approval_policy() RPC wrapper + listPolicySummaries/getPolicyForRequestType reads
+      build-policy-modal.ts       # pure (M9): Configure/Edit policy modal — approvers, required approvals, Active/Disabled (unit tested)
+      build-policy-modal.test.ts
+      validate-policy-submission.ts  # pure (M9): policy modal view_submission validation (unit tested)
+      validate-policy-submission.test.ts
+      build-policy-views.ts       # pure (M9): "Manage Approval Policies" list view (unit tested)
+      build-policy-views.test.ts
+      build-admin-views.ts        # pure (M9): "Manage Administrators" + "Add Administrator" modal builders (unit tested)
+      build-admin-views.test.ts
+      admin-interaction-handlers.ts  # server-only (M9): block_actions/view_submission handlers for admin + policy management, dispatched from interactions/route.ts
+      build-request-modal.ts      # pure: request-type-aware Block Kit modal builder, dynamically shaped per TimingMode/expense (M8 field-matrix correction; unit tested); M9: hides Approver under an active policy
       build-request-modal.test.ts
-      validate-request-submission.ts  # pure: view_submission validation, type-specific per REQUEST_TYPE_FIELD_CONFIG (unit tested; M8 field-matrix correction)
+      validate-request-submission.ts  # pure: view_submission validation, type-specific per REQUEST_TYPE_FIELD_CONFIG (unit tested; M8 field-matrix correction); M9: Approver is now optional here — requiredness depends on live policy state resolved by the caller
       validate-request-submission.test.ts
       build-approval-notification.ts  # pure: approver DM builder, message update, outcome text (M8: Details terminology, optional Reason; M8 correction: When timing)
       parse-block-action.ts       # pure: block_actions (Approve/Reject) validation — message- and modal-origin (unit tested; M7: now also requires trigger_id)
@@ -2499,7 +2765,7 @@ src/
       parse-requests-action.test.ts
       build-requests-views.ts     # pure (M5): Request Center / Waiting List / Request Details Block Kit views (unit tested; M8: Details/When-Duration terminology, optional Reason)
       build-requests-views.test.ts
-      build-app-home-view.ts      # pure (M6): App Home Block Kit view builder, reuses build-requests-views' row builder (unit tested; M8: updated intro copy)
+      build-app-home-view.ts      # pure (M6): App Home Block Kit view builder, reuses build-requests-views' row builder (unit tested; M8: updated intro copy; M9: admin-only Administration section)
       build-app-home-view.test.ts
       request-views.ts            # server-only (M5, extended M6/M7): listRequestsByRequester (optional limit), listRequestsWaitingForApprover, getRequestDetails (M7: + approval comment; M8.1: fewer/parallelized round trips in the POLICY branch)
     supabase/
@@ -2508,9 +2774,11 @@ src/
     workspace.ts                  # Workspace row type (M8.1: + InstallationStatus, uninstalled_at, nullable token fields)
     request.ts                    # User, RequestType, RequestRow types (incl. M4 routing fields; M8: reason is nullable)
     approval.ts                   # ApprovalPolicy, Approval, DecideOnRequestResult types
+    admin.ts                      # M9: WorkspaceAdmin row type + the three new RPCs' result types
 
 scripts/
   configure-approval-policy.ts    # admin CLI: assign approvers to a request type (not an HTTP endpoint)
+  bootstrap-workspace-admin.ts    # M9 admin CLI: grant a specific Slack user admin for a pre-M9 workspace (not an HTTP endpoint; NOT run against production yet)
 
 supabase/
   config.toml
@@ -2528,7 +2796,11 @@ supabase/
     # M6 adds no migration either — Home is a read-mostly front door over the existing schema.
     *_add_approval_comment_constraints.sql          # M7 — deployed
     *_update_decide_on_request_for_comment_validation.sql  # M7 — deployed
-    *_relax_requests_reason_not_null.sql            # M8 — NOT YET PUSHED, pending review
-    *_deactivate_legacy_request_types.sql           # M8 — NOT YET PUSHED, pending review
-    *_add_request_timing_fields.sql                 # M8 correction — NOT YET PUSHED, pending review
+    *_relax_requests_reason_not_null.sql            # M8 — deployed
+    *_deactivate_legacy_request_types.sql           # M8 — deployed
+    *_add_request_timing_fields.sql                 # M8 correction — deployed
+    *_add_request_expense_fields.sql                # M8 field-matrix correction — deployed
+    *_add_workspace_installation_lifecycle.sql      # M8.1 — deployed
+    *_add_workspace_admin_model.sql                 # M9 — deployed, dynamically verified with synthetic data
+    *_fix_workspace_admin_rpc_column_ambiguity.sql  # M9 corrective — deployed; #variable_conflict fix for a RETURNS TABLE column-name collision found during verification
 ```

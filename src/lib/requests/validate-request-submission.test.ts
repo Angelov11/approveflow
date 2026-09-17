@@ -72,10 +72,12 @@ test("Details are required for every request type", () => {
   if (!result.ok) assert.ok(result.errors.resource_block);
 });
 
-test("Approver is required for every request type", () => {
-  const result = validateRequestSubmission(buildPayload({ approver: null }), { validRequestTypeKeys });
-  assert.equal(result.ok, false);
-  if (!result.ok) assert.ok(result.errors.approver_block);
+test("M9: a missing Approver is NOT rejected by this pure validator alone — whether it's required depends on live policy state the caller resolves separately", () => {
+  const result = validateRequestSubmission(buildPayload({ requestType: "other", approver: null }), { validRequestTypeKeys });
+  assert.equal(result.ok, true);
+  if (result.ok) {
+    assert.equal(result.data.selectedApproverSlackId, null);
+  }
 });
 
 test("oversized Details are rejected", () => {

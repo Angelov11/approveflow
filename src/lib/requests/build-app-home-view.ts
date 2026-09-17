@@ -1,5 +1,6 @@
 import type { WebClient } from "@slack/web-api";
 
+import { MANAGE_ADMINISTRATORS_ACTION_ID, MANAGE_POLICIES_ACTION_ID } from "./build-admin-views.ts";
 import { buildRequestRowBlocks, type RequestSummary } from "./build-requests-views.ts";
 import { CREATE_REQUEST_ACTION_ID, OPEN_REQUEST_CENTER_ACTION_ID, VIEW_WAITING_REQUESTS_ACTION_ID } from "./parse-requests-action.ts";
 
@@ -15,6 +16,8 @@ export interface BuildAppHomeViewParams {
   /** The requester's TOTAL request count (not just the ones shown) — used only to decide whether "View all requests" is worth showing. */
   myRequestsTotalCount: number;
   waitingCount: number;
+  /** M9: whether the viewer currently holds an admin grant for this workspace — resolved server-side (isWorkspaceAdmin) by the caller, never inferred here. Hiding the Administration section for a non-admin is UX only; every action inside it independently reauthorizes regardless of whether this flag was ever true. */
+  isAdmin: boolean;
 }
 
 /**
@@ -30,7 +33,7 @@ export interface BuildAppHomeViewParams {
  * `origin` field) instead of pushed onto one already open. `/requests`
  * still opens this same Request Center directly, as a shortcut.
  */
-export function buildAppHomeView({ recentRequests, myRequestsTotalCount, waitingCount }: BuildAppHomeViewParams): HomeView {
+export function buildAppHomeView({ recentRequests, myRequestsTotalCount, waitingCount, isAdmin }: BuildAppHomeViewParams): HomeView {
   const blocks: unknown[] = [
     {
       type: "section",
@@ -82,6 +85,23 @@ export function buildAppHomeView({ recentRequests, myRequestsTotalCount, waiting
         text: { type: "plain_text", text: "View pending approvals" },
       },
     });
+  }
+
+  if (isAdmin) {
+    blocks.push(
+      { type: "divider" },
+      { type: "header", text: { type: "plain_text", text: "Administration" } },
+      {
+        type: "section",
+        text: { type: "mrkdwn", text: "*Approval Policies*\nConfigure automatic routing for workplace requests." },
+        accessory: { type: "button", action_id: MANAGE_POLICIES_ACTION_ID, text: { type: "plain_text", text: "Manage Approval Policies" } },
+      },
+      {
+        type: "section",
+        text: { type: "mrkdwn", text: "*Administrators*\nManage who can configure ApproveFlow." },
+        accessory: { type: "button", action_id: MANAGE_ADMINISTRATORS_ACTION_ID, text: { type: "plain_text", text: "Manage Administrators" } },
+      },
+    );
   }
 
   return { type: "home", blocks } as HomeView;

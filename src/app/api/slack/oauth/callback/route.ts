@@ -87,32 +87,31 @@ export async function GET(request: NextRequest) {
   // 4. Encrypt before persisting. Plaintext tokens never reach the database or logs.
   const encryptedToken = encryptBotToken(accessToken);
 
-  // 5. Upsert by slack_team_id so reinstalling updates the existing row instead
-  // of duplicating it. M8.1: every successful OAuth completion — fresh install
-  // OR reinstall after an uninstall/token-revocation — unconditionally sets
-  // installation_status back to 'INSTALLED' and clears uninstalled_at. No
-  // "is this a reinstall" branch is needed: upserting fixed values is
-  // idempotent regardless of the row's prior state. first_installed_at is
-  // deliberately not set here (and not a column at all — see the M8.1
-  // migration) since installed_at already means "most recent install."
+  // 5. M9: install_or_reinstall_workspace() atomically persists the Slack
+  // installation AND, only for a genuinely brand-new workspace, bootstraps
+  // the human OAuth installer as the first ApproveFlow admin — in the same
+  // transaction, so there is no window where the workspace exists with zero
+  // admins because a follow-up insert never ran. `authed_user.id` (present
+  // in oauth.v2.access's response even for a bot-scopes-only install — see
+  // the M9 audit) is the ONLY source of installer identity ever used here;
+  // `bot_user_id` identifies the app's own bot account, never a human, and
+  // is never treated as an admin candidate. A reinstall (existing
+  // workspace, any prior installation_status) only updates installation/
+  // token fields — workspace_admins is never touched in that branch, see
+  // the migration for the exact mechanism.
   const supabase = getSupabaseAdmin();
-  const { error: dbError } = await timer.time("db", "upsertWorkspace", async () =>
-    supabase.from("workspaces").upsert(
-      {
-        slack_team_id: teamId,
-        slack_enterprise_id: oauthResponse.enterprise?.id ?? null,
-        slack_app_id: oauthResponse.app_id ?? null,
-        name: oauthResponse.team?.name ?? null,
-        bot_user_id: oauthResponse.bot_user_id ?? null,
-        bot_access_token_ciphertext: encryptedToken.ciphertext,
-        bot_access_token_iv: encryptedToken.iv,
-        bot_access_token_auth_tag: encryptedToken.authTag,
-        installation_status: "INSTALLED",
-        uninstalled_at: null,
-        installed_at: new Date().toISOString(),
-      },
-      { onConflict: "slack_team_id" },
-    ),
+  const { data: rpcData, error: dbError } = await timer.time("db", "installOrReinstallWorkspace", async () =>
+    supabase.rpc("install_or_reinstall_workspace", {
+      p_slack_team_id: teamId,
+      p_slack_enterprise_id: oauthResponse.enterprise?.id ?? null,
+      p_slack_app_id: oauthResponse.app_id ?? null,
+      p_name: oauthResponse.team?.name ?? null,
+      p_bot_user_id: oauthResponse.bot_user_id ?? null,
+      p_bot_access_token_ciphertext: encryptedToken.ciphertext,
+      p_bot_access_token_iv: encryptedToken.iv,
+      p_bot_access_token_auth_tag: encryptedToken.authTag,
+      p_installer_slack_user_id: oauthResponse.authed_user?.id ?? null,
+    }),
   );
 
   if (dbError) {
@@ -121,6 +120,13 @@ export async function GET(request: NextRequest) {
     return redirectToResult(request, "error", "storage_failed");
   }
 
-  timer.ack("success");
+  const result = Array.isArray(rpcData) ? rpcData[0] : rpcData;
+  if (!result) {
+    console.error("install_or_reinstall_workspace returned no result");
+    timer.ack("storage_failed");
+    return redirectToResult(request, "error", "storage_failed");
+  }
+
+  timer.ack(result.is_new_workspace ? "success_new_workspace" : "success_reinstall");
   return redirectToResult(request, "success");
 }

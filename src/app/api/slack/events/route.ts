@@ -8,6 +8,7 @@ import { createRequestTimer, type RequestTimer } from "@/lib/observability/timin
 import { buildAppHomeView, HOME_RECENT_REQUESTS_LIMIT } from "@/lib/requests/build-app-home-view";
 import { computeInstallationTransition, type InstallationEvent, type InstallationTransitionResult } from "@/lib/requests/compute-installation-transition";
 import { listRequestsByRequester, listRequestsWaitingForApprover } from "@/lib/requests/request-views";
+import { isWorkspaceAdmin } from "@/lib/requests/workspace-admins";
 import { findWorkspaceBySlackTeamId, getUsableInstallation, upsertSlackUser } from "@/lib/requests/workspace-lookup";
 import { parseSlackEvent, type SlackEventEnvelope } from "@/lib/slack/parse-slack-event";
 import { decryptBotToken } from "@/lib/slack/token-encryption";
@@ -33,14 +34,20 @@ async function publishHomeView(timer: RequestTimer, slackTeamId: string, slackUs
 
   const viewer = await timer.time("db", "upsertSlackUser", () => upsertSlackUser(workspace.id, slackUserId));
 
-  const [{ rows: recentRequests, totalCount: myRequestsTotalCount }, waitingRequests] = await timer.time("db", "listRequestsForHome", () =>
+  // M9: admin status is resolved in parallel with the existing Home
+  // queries — this handler already runs entirely inside after() (M8.1),
+  // so there is no trigger_id/ack budget to protect here regardless; the
+  // parallelization is purely to avoid an unnecessary extra sequential
+  // stage even in the deferred path.
+  const [{ rows: recentRequests, totalCount: myRequestsTotalCount }, waitingRequests, isAdmin] = await timer.time("db", "listRequestsAndAdminStatusForHome", () =>
     Promise.all([
       listRequestsByRequester(workspace.id, viewer.id, HOME_RECENT_REQUESTS_LIMIT),
       listRequestsWaitingForApprover(workspace.id, viewer.id),
+      isWorkspaceAdmin(workspace.id, slackUserId),
     ]),
   );
 
-  const view = buildAppHomeView({ recentRequests, myRequestsTotalCount, waitingCount: waitingRequests.length });
+  const view = buildAppHomeView({ recentRequests, myRequestsTotalCount, waitingCount: waitingRequests.length, isAdmin });
 
   const botToken = decryptBotToken({
     ciphertext: workspace.bot_access_token_ciphertext,

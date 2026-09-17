@@ -218,3 +218,54 @@ test("a selected type is reflected as the Request Type select's initial_option",
   const typeBlock = view.blocks.find((b): b is PlainInputBlock => "block_id" in b && b.block_id === "request_type_block");
   assert.equal(typeBlock?.element.initial_option?.value, "doctor_appointment");
 });
+
+// --- M9: policy-aware Approver field ---
+
+test("with no active policy for the selected type, the Approver picker is shown (DIRECT)", () => {
+  const view = build({ selectedTypeKey: "vacation_time_off" });
+  assert.ok(inputBlockIds(view).includes("approver_block"));
+});
+
+test("with an active policy for the selected type, the Approver picker is REPLACED by a read-only routing summary", () => {
+  const view = build({
+    selectedTypeKey: "expense_purchase",
+    activePolicySummary: { approverSlackIds: ["U0GARY123", "U0FINANCE1"], requiredApprovals: 2 },
+  });
+  assert.ok(!inputBlockIds(view).includes("approver_block"));
+  const text = JSON.stringify(view.blocks);
+  assert.ok(text.includes("Automatically routed according to workspace policy"));
+  assert.ok(text.includes("<@U0GARY123>"));
+  assert.ok(text.includes("<@U0FINANCE1>"));
+  assert.ok(text.includes("2 approvals required"));
+});
+
+test("policy summary singular phrasing for exactly one required approval", () => {
+  const view = build({ selectedTypeKey: "expense_purchase", activePolicySummary: { approverSlackIds: ["U0GARY123"], requiredApprovals: 1 } });
+  const text = JSON.stringify(view.blocks);
+  assert.ok(text.includes("1 approval required"));
+  assert.ok(!text.includes("1 approvals required"));
+});
+
+test("switching from a policy-governed type back to one with no policy restores the Approver picker (POLICY -> DIRECT)", () => {
+  const withPolicy = build({ selectedTypeKey: "expense_purchase", activePolicySummary: { approverSlackIds: ["U0GARY123"], requiredApprovals: 1 } });
+  const withoutPolicy = build({ selectedTypeKey: "vacation_time_off", activePolicySummary: null });
+  assert.ok(!inputBlockIds(withPolicy).includes("approver_block"));
+  assert.ok(inputBlockIds(withoutPolicy).includes("approver_block"));
+});
+
+test("switching from DIRECT to a policy-governed type hides the Approver picker (DIRECT -> POLICY), other type-aware fields unaffected", () => {
+  const view = build({
+    selectedTypeKey: "expense_purchase",
+    activePolicySummary: { approverSlackIds: ["U0GARY123"], requiredApprovals: 1 },
+    preserved: { resource: "External monitor", expense: { amount: "499.99", currency: "EUR" } },
+  });
+  const blockIds = inputBlockIds(view);
+  assert.ok(!blockIds.includes("approver_block"));
+  assert.ok(blockIds.includes("expense_amount_block"));
+  assert.ok(blockIds.includes("expense_currency_block"));
+});
+
+test("no type selected yet: Approver picker still shows by default (no policy summary to evaluate)", () => {
+  const view = build();
+  assert.ok(inputBlockIds(view).includes("approver_block"));
+});

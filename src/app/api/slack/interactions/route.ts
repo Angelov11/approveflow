@@ -7,7 +7,26 @@ import type { NextRequest } from "next/server";
 import { serverEnv } from "@/lib/env.server";
 import { createRequestTimer, type RequestTimer } from "@/lib/observability/timing";
 import { decideOnRequest } from "@/lib/requests/approval-actions";
+import {
+  handleAddAdministratorOpen,
+  handleAddAdministratorSubmission,
+  handleConfigurePolicyOpen,
+  handleManageAdministrators,
+  handleManagePolicies,
+  handlePolicySubmission,
+  handleRemoveAdministrator,
+} from "@/lib/requests/admin-interaction-handlers";
 import { findActivePolicyForRequestType, listPolicyRecipients } from "@/lib/requests/approval-policies";
+import {
+  ADD_ADMINISTRATOR_ACTION_ID,
+  ADD_ADMINISTRATOR_CALLBACK_ID,
+  MANAGE_ADMINISTRATORS_ACTION_ID,
+  MANAGE_POLICIES_ACTION_ID,
+  REMOVE_ADMINISTRATOR_ACTION_ID,
+  CONFIGURE_POLICY_ACTION_ID,
+} from "@/lib/requests/build-admin-views";
+import { CONFIGURE_POLICY_CALLBACK_ID } from "@/lib/requests/build-policy-modal";
+import type { PolicySubmissionPayload } from "@/lib/requests/validate-policy-submission";
 import { buildApprovalNotification, describeDecisionOutcome, replaceActionsWithStatus, APPROVE_ACTION_ID, REJECT_ACTION_ID } from "@/lib/requests/build-approval-notification";
 import {
   APPROVE_DECISION_CALLBACK_ID,
@@ -30,6 +49,7 @@ import {
   VIEW_WAITING_REQUESTS_ACTION_ID,
   type RequestsNavigationPayload,
 } from "@/lib/requests/parse-requests-action";
+import { computeRequestRoutingDecision } from "@/lib/requests/compute-request-routing";
 import { getRequestDetails, listRequestsByRequester, listRequestsWaitingForApprover } from "@/lib/requests/request-views";
 import { getRequestTypeFieldConfig, remapExpenseForModeChange, remapTimingForModeChange } from "@/lib/requests/request-type-config";
 import { ensureDefaultRequestTypes, listActiveRequestTypes } from "@/lib/requests/request-types";
@@ -98,7 +118,14 @@ export async function POST(request: NextRequest) {
     return ack();
   }
 
-  let payload: { type?: string; actions?: { action_id?: string }[]; view?: { callback_id?: string } };
+  let payload: {
+    type?: string;
+    team?: { id?: string };
+    user?: { id?: string };
+    trigger_id?: string;
+    actions?: { action_id?: string; value?: string }[];
+    view?: { id?: string; type?: string; callback_id?: string };
+  };
   try {
     payload = JSON.parse(rawPayload);
   } catch {
@@ -126,6 +153,22 @@ export async function POST(request: NextRequest) {
     if (actionId === REQUEST_TYPE_SELECT_ACTION_ID) {
       return handleRequestTypeChanged(payload as RequestTypeChangedPayload, timer);
     }
+    // M9: admin/policy management — see admin-interaction-handlers.ts.
+    if (actionId === MANAGE_ADMINISTRATORS_ACTION_ID) {
+      return handleManageAdministrators(payload, timer);
+    }
+    if (actionId === ADD_ADMINISTRATOR_ACTION_ID) {
+      return handleAddAdministratorOpen(payload, timer);
+    }
+    if (actionId === REMOVE_ADMINISTRATOR_ACTION_ID) {
+      return handleRemoveAdministrator(payload, timer);
+    }
+    if (actionId === MANAGE_POLICIES_ACTION_ID) {
+      return handleManagePolicies(payload, timer);
+    }
+    if (actionId === CONFIGURE_POLICY_ACTION_ID) {
+      return handleConfigurePolicyOpen(payload, timer);
+    }
     // Not one of our recognized actions — ignore safely.
     timer.ack("ignored");
     return ack();
@@ -138,6 +181,12 @@ export async function POST(request: NextRequest) {
     }
     if (callbackId === APPROVE_DECISION_CALLBACK_ID || callbackId === REJECT_DECISION_CALLBACK_ID) {
       return handleDecisionSubmission(payload as DecisionSubmissionPayload, callbackId === REJECT_DECISION_CALLBACK_ID ? "REJECTED" : "APPROVED", timer);
+    }
+    if (callbackId === ADD_ADMINISTRATOR_CALLBACK_ID) {
+      return handleAddAdministratorSubmission(payload, timer);
+    }
+    if (callbackId === CONFIGURE_POLICY_CALLBACK_ID) {
+      return handlePolicySubmission(payload as PolicySubmissionPayload, timer);
     }
     timer.ack("ignored");
     return ack();
@@ -205,36 +254,48 @@ async function handleRequestSubmission(payload: ViewSubmissionPayload, timer: Re
   // later by asking "is there an active policy right now" (see the M4
   // migration adding these columns for why that would be unstable).
   //
-  // Case A: an active policy exists → POLICY routing. The requester's
-  // selected approver is resolved (so it's a valid workspace user) but
-  // deliberately NOT persisted as though they were responsible for the
-  // request — company policy takes precedence over a manual pick.
+  // M9: this is also the ONLY place that determines "current routing
+  // truth" for this submission — the Create Request modal hides the
+  // Approver field once it believes a policy is active, but that belief
+  // can be stale by the time the requester actually submits (an admin may
+  // have disabled the policy in between). Never trust what the modal
+  // displayed: re-check the active policy fresh, right here.
   //
-  // Case B: no active policy → DIRECT routing, using exactly the selected
-  // approver, requiring exactly 1 approval.
+  // Case A: an active policy exists → POLICY routing. A manually-selected
+  // approver, if the (stale) modal happened to still collect one, is
+  // resolved for validity but deliberately NOT persisted as though they
+  // were responsible for the request — company policy takes precedence.
   //
-  // M8.1: these two lookups are independent of each other — parallelized
-  // instead of sequential, one fewer DB round trip before the insert.
-  const [activePolicy, directApprover] = await timer.time("db", "policyAndApprover", () =>
-    Promise.all([
-      findActivePolicyForRequestType(workspace.id, requestType.id),
-      upsertSlackUser(workspace.id, result.data.selectedApproverSlackId),
-    ]),
-  );
+  // Case B: no active policy → DIRECT routing, requiring a selected
+  // approver. If the modal never collected one — because it was built
+  // believing a policy was still active — this submission is rejected
+  // with a friendly "please reopen" error rather than silently guessing an
+  // approver or fabricating routing that was never actually authorized.
+  const activePolicy = await timer.time("db", "findActivePolicy", () => findActivePolicyForRequestType(workspace.id, requestType.id));
+  const routingDecision = computeRequestRoutingDecision(Boolean(activePolicy), result.data.selectedApproverSlackId);
 
-  const routingFields = activePolicy
-    ? {
-        routing_type: "POLICY" as const,
-        approval_policy_id: activePolicy.id,
-        direct_approver_id: null,
-        required_approval_count: activePolicy.required_approvals,
-      }
-    : {
-        routing_type: "DIRECT" as const,
-        approval_policy_id: null,
-        direct_approver_id: directApprover.id,
-        required_approval_count: 1,
-      };
+  if (routingDecision.kind === "rejected_stale_modal") {
+    timer.ack("routing_changed");
+    return modalErrors({ approver_block: "This request type's approval routing just changed. Please close this window and reopen Create Request." });
+  }
+
+  let routingFields:
+    | { routing_type: "POLICY"; approval_policy_id: string; direct_approver_id: null; required_approval_count: number }
+    | { routing_type: "DIRECT"; approval_policy_id: null; direct_approver_id: string; required_approval_count: 1 };
+
+  if (activePolicy) {
+    // routingDecision.kind is guaranteed "policy" here — computeRequestRoutingDecision
+    // returns "policy" exactly when hasActivePolicy (Boolean(activePolicy)) was true.
+    routingFields = {
+      routing_type: "POLICY",
+      approval_policy_id: activePolicy.id,
+      direct_approver_id: null,
+      required_approval_count: activePolicy.required_approvals,
+    };
+  } else if (routingDecision.kind === "direct") {
+    const directApprover = await timer.time("db", "upsertApprover", () => upsertSlackUser(workspace.id, routingDecision.approverSlackId));
+    routingFields = { routing_type: "DIRECT", approval_policy_id: null, direct_approver_id: directApprover.id, required_approval_count: 1 };
+  }
 
   const supabase = getSupabaseAdmin();
   const { data: inserted, error } = await timer.time("db", "insertRequest", async () =>
@@ -287,7 +348,10 @@ async function handleRequestSubmission(payload: ViewSubmissionPayload, timer: Re
   const timing = result.data.timing;
   const expense = result.data.expense;
   const requesterSlackId = result.data.slackUserId;
-  const selectedApproverSlackId = result.data.selectedApproverSlackId;
+  // Guaranteed non-null whenever activePolicyId is null (DIRECT) — see the
+  // routing determination above, which rejects the submission outright
+  // otherwise. Only ever read in the DIRECT branch below.
+  const selectedApproverSlackId = result.data.selectedApproverSlackId as string;
   const activePolicyId = activePolicy?.id ?? null;
 
   // Best-effort notification, deferred until after the response is sent —
@@ -413,6 +477,24 @@ async function handleRequestTypeChanged(payload: RequestTypeChangedPayload, time
         const requestTypes = await listActiveRequestTypes(workspace.id);
         const newConfig = getRequestTypeFieldConfig(newTypeKey);
 
+        // M9: is the newly-selected type currently governed by an active
+        // policy? This is the ONLY place this is computed for rendering —
+        // it never gates the initial synchronous modal-open path at all,
+        // since every real submission necessarily goes through at least
+        // one dispatch_action-triggered rebuild first (Request Type is a
+        // required field with no default selection). Zero impact on the
+        // trigger_id-bound open flows; this after() callback already has
+        // no trigger_id budget to protect.
+        const newRequestType = requestTypes.find((type) => type.key === newTypeKey);
+        let activePolicySummary: { approverSlackIds: string[]; requiredApprovals: number } | null = null;
+        if (newRequestType) {
+          const policy = await findActivePolicyForRequestType(workspace.id, newRequestType.id);
+          if (policy) {
+            const recipients = await listPolicyRecipients(policy.id);
+            activePolicySummary = { approverSlackIds: recipients.map((r) => r.slack_user_id), requiredApprovals: policy.required_approvals };
+          }
+        }
+
         const currentTiming: RequestTiming = {
           startDate: readCurrentField(payload, START_DATE_BLOCK_ID, START_DATE_ACTION_ID),
           startTime: readCurrentField(payload, START_TIME_BLOCK_ID, START_TIME_ACTION_ID),
@@ -432,7 +514,7 @@ async function handleRequestTypeChanged(payload: RequestTypeChangedPayload, time
           expense: remapExpenseForModeChange(currentExpense, newConfig.expense),
         };
 
-        const view = buildRequestModal({ requestTypes, idempotencyKey, selectedTypeKey: newTypeKey, preserved });
+        const view = buildRequestModal({ requestTypes, idempotencyKey, selectedTypeKey: newTypeKey, preserved, activePolicySummary });
 
         const botToken = decryptBotToken({
           ciphertext: workspace.bot_access_token_ciphertext,

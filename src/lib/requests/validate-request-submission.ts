@@ -62,8 +62,16 @@ export interface ValidatedRequestSubmission {
   timing: RequestTiming;
   /** Non-null only when the selected type's config marks it expense-bearing. */
   expense: RequestExpense;
-  /** The Slack user ID selected via the modal's native picker — an identifier only, not an authorization claim. See the interactions route for how it's actually used (or discarded) depending on routing. */
-  selectedApproverSlackId: string;
+  /**
+   * The Slack user ID selected via the modal's native picker, or null when
+   * the field wasn't shown/filled in. An identifier only, not an
+   * authorization claim. M9: whether this is REQUIRED depends on whether
+   * an active policy currently governs the submitted request type — DB
+   * state this pure function has no access to — so that decision is made
+   * by the caller (see the interactions route), not here. This function
+   * only validates the field's FORMAT when present.
+   */
+  selectedApproverSlackId: string | null;
 }
 
 export type RequestSubmissionResult =
@@ -234,14 +242,24 @@ export function validateRequestSubmission(
   }
   // An unknown/invalid request type already fails via request_type_block above — timing/expense are left at their null defaults rather than guessing a mode for a type we couldn't resolve.
 
-  // Required even though a POLICY-routed submission will end up ignoring
-  // it server-side — the modal can't know client-side whether a policy
-  // exists for the currently-selected request type without dynamic modal
-  // mutation, which M4 deliberately doesn't implement. See the interactions
-  // route for how this is resolved/discarded depending on routing.
-  const selectedApproverSlackId = getFieldValue(payload, "approver_block", "approver_select");
-  if (!selectedApproverSlackId || !SLACK_USER_ID_PATTERN.test(selectedApproverSlackId)) {
-    errors.approver_block = "Please select an approver.";
+  // M9: the modal hides this field entirely when the selected type currently
+  // has an active policy (see build-request-modal.ts), so its absence here
+  // is expected and NOT an error at this layer — whether it's actually
+  // required is a routing decision that depends on fresh, server-side
+  // policy state this pure function has no access to (see the interactions
+  // route's handleRequestSubmission, which re-checks the active policy and
+  // rejects a submission that's missing an approver when routing truth
+  // says DIRECT). When present, only its FORMAT is validated here — a
+  // well-formed-but-ultimately-ignored value under POLICY routing is not
+  // an error either; the interactions route decides whether to use it.
+  const rawApproverSlackId = getFieldValue(payload, "approver_block", "approver_select");
+  let selectedApproverSlackId: string | null = null;
+  if (rawApproverSlackId) {
+    if (!SLACK_USER_ID_PATTERN.test(rawApproverSlackId)) {
+      errors.approver_block = "Please select a valid approver.";
+    } else {
+      selectedApproverSlackId = rawApproverSlackId;
+    }
   }
 
   if (Object.keys(errors).length > 0) {
@@ -258,7 +276,7 @@ export function validateRequestSubmission(
       resource,
       timing,
       expense,
-      selectedApproverSlackId: selectedApproverSlackId as string,
+      selectedApproverSlackId,
     },
   };
 }

@@ -38,6 +38,12 @@ export interface PreservedRequestFields {
   expense?: { amount: string | null; currency: string | null };
 }
 
+/** M9: when set, the selected type currently has an active approval policy — the Approver picker is replaced with a read-only summary instead. Approver slack IDs are rendered as `<@id>` mentions, resolved client-side by Slack — no name storage/lookup needed. */
+export interface ActivePolicySummary {
+  approverSlackIds: string[];
+  requiredApprovals: number;
+}
+
 export interface BuildRequestModalParams {
   requestTypes: Pick<RequestType, "key" | "name">[];
   /** Correlates this specific opened view for idempotent submission handling (see src/app/api/slack/interactions). */
@@ -46,6 +52,8 @@ export interface BuildRequestModalParams {
   selectedTypeKey?: string | null;
   /** Carried over from the previous render when the requester changes Request Type mid-modal (see request-type-config.ts's remap helpers) — never fabricated. */
   preserved?: PreservedRequestFields;
+  /** Undefined/null when the selected type has no active policy (or no type is selected yet) — shows the normal Approver picker in that case. */
+  activePolicySummary?: ActivePolicySummary | null;
 }
 
 function sectionLabel(text: string): unknown {
@@ -65,12 +73,16 @@ function sectionLabel(text: string): unknown {
  *
  * The Details field's block_id/action_id stay `resource_block`/
  * `resource_input` internally — it still maps directly to the `resource`
- * database column, which was never renamed. The Approver field no longer
- * explains policy routing to ordinary employees — that's an internal
- * implementation detail, not something the requester needs to know or act
- * on.
+ * database column, which was never renamed. M9: the Approver field itself
+ * is now conditional — when `activePolicySummary` is set (the selected
+ * type currently has an active policy), a read-only routing summary
+ * replaces the picker entirely, since a manual selection there would only
+ * ever be silently discarded server-side. `activePolicySummary` must
+ * reflect fresh, server-side policy state at the moment this view is
+ * built — see the interactions route's dynamic-modal handler, which is
+ * the only place this is computed.
  */
-export function buildRequestModal({ requestTypes, idempotencyKey, selectedTypeKey, preserved }: BuildRequestModalParams): ModalView {
+export function buildRequestModal({ requestTypes, idempotencyKey, selectedTypeKey, preserved, activePolicySummary }: BuildRequestModalParams): ModalView {
   const config = selectedTypeKey ? getRequestTypeFieldConfig(selectedTypeKey) : null;
   const timing = preserved?.timing;
   const expense = preserved?.expense;
@@ -266,10 +278,24 @@ export function buildRequestModal({ requestTypes, idempotencyKey, selectedTypeKe
     );
   }
 
-  blocks.push(
-    { type: "divider" },
-    sectionLabel("Approval"),
-    {
+  blocks.push({ type: "divider" }, sectionLabel("Approval"));
+
+  if (activePolicySummary) {
+    // M9: no meaningless manual Approver picker when routing is already
+    // determined by workspace policy — a selection here would only ever be
+    // silently discarded server-side. Approver identities are rendered as
+    // `<@id>` mentions; Slack resolves the display name client-side, so no
+    // name storage/lookup is needed here.
+    const approverMentions = activePolicySummary.approverSlackIds.map((id) => `<@${id}>`).join(" ");
+    blocks.push({
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: `Automatically routed according to workspace policy.\n${approverMentions}\n${activePolicySummary.requiredApprovals} approval${activePolicySummary.requiredApprovals === 1 ? "" : "s"} required`,
+      },
+    });
+  } else {
+    blocks.push({
       type: "input",
       block_id: "approver_block",
       label: { type: "plain_text", text: "Approver" },
@@ -281,8 +307,8 @@ export function buildRequestModal({ requestTypes, idempotencyKey, selectedTypeKe
         placeholder: { type: "plain_text", text: "Select an approver" },
         ...(preserved?.approverSlackId ? { initial_user: preserved.approverSlackId } : {}),
       },
-    },
-  );
+    });
+  }
 
   return {
     type: "modal",
