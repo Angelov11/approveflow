@@ -2786,7 +2786,7 @@ confirmed zero mutation. No Paddle dependency, API call, catalog, or
 environment secret existed anywhere in this repo as of M10.1 — see M10.2
 below for where that starts.
 
-## M10.2: Paddle Sandbox Catalog & Secure Checkout (Sandbox only — implemented locally, not yet committed)
+## M10.2: Paddle Sandbox Catalog & Secure Checkout (Sandbox only — committed and pushed)
 
 ### Scope: checkout only — no webhooks, no entitlement grant
 
@@ -2944,13 +2944,71 @@ and typed request/response shapes correctly, which is a better
 security/maintenance trade than reimplementing that by hand. No custom
 payment-provider abstraction layer sits on top of them.
 
-### Status: implemented locally, not committed
+### Status: committed and pushed — verified end-to-end in Sandbox
 
-The Sandbox catalog exists in Paddle and the code above is implemented
-and tested locally, but nothing in this section has been committed,
-pushed, or deployed yet — see the M10.2 review report for the full
-verification trail (tests/lint/build, and the exact production-safety
-review) before that happens.
+The Sandbox catalog exists in Paddle and the code above is committed and
+pushed to `main`. A real Sandbox Transaction was created through the full
+flow and the genuine Paddle Sandbox Checkout UI was visually confirmed
+("Test Mode" badge, correct product/price). Production Vercel does not
+yet have the M10.2 Paddle environment variables configured — see M10.3
+below for the exact list still missing before a deployed checkout can
+work.
+
+## M10.3: Paddle Webhook Synchronization (implemented locally — migration not yet applied)
+
+### Webhooks are the only authoritative entitlement source
+
+`POST /api/paddle/webhooks` receives Paddle's subscription lifecycle
+events and is the **only** thing that ever writes to
+`workspace_subscriptions`. A successful browser checkout (M10.2) is a UX
+signal only — it never grants Pro. `workspace_subscriptions` stays
+exactly as it was until a verified webhook says otherwise, even right
+after a real payment succeeds.
+
+The flow: Paddle → raw request body + `paddle-signature` header →
+official SDK signature verification (`@paddle/paddle-node-sdk`'s
+`webhooks.unmarshal`) → pure normalization → the atomic
+`process_paddle_subscription_event` RPC → `billing_webhook_events` /
+`workspace_subscriptions` → the existing, unchanged entitlement resolver
+(`isEntitledToPro`/`getWorkspaceEntitlements`) picks up the new state
+automatically, with zero code changes on that side.
+
+Subscribed events: `subscription.created`, `subscription.updated`,
+`subscription.canceled` — verified against the installed SDK's own event
+model rather than assumed; the other subscription-lifecycle events Paddle
+can emit (`activated`, `past_due`, `paused`, `resumed`, `trialing`) are
+redundant companions to `subscription.updated`, which already carries
+full state on every one of those transitions.
+
+### Duplicate and out-of-order events are both safe by design
+
+- **Duplicates**: idempotent on `(provider, provider_event_id)` — Paddle
+  redelivers the exact same event id on every retry. A second delivery of
+  an already-applied event is a no-op (`duplicate_processed`).
+- **Out-of-order events**: Paddle does not guarantee delivery order.
+  Ordering is decided by `workspace_subscriptions.last_event_occurred_at`,
+  never by arrival order — an event older than (or equal to) what's
+  already applied is safely ignored (`stale_event_ignored`) but still
+  marked processed.
+- **Entitlement never granted incorrectly**: an event naming an unknown
+  workspace, the wrong Paddle price, the wrong quantity, or a
+  `provider_subscription_id` already attached to a *different* workspace
+  is recorded and safely ignored — never silently applied.
+
+No raw Paddle payload is ever stored, and no payment/customer personal
+data beyond the provider's own opaque customer/subscription ids.
+
+### Still pending
+
+Application-level policy-routing gating (M10.4 — an active policy only
+actually routes requests once the workspace is entitled) is untouched;
+`interactions/route.ts` and `decide_on_request()` are unchanged, and the
+existing "Production Access Approval" policy keeps routing exactly as
+before. Customer Portal / Manage Billing is not implemented. The
+migration below has not been applied to production, no Paddle webhook
+destination has been created, and production Vercel does not yet have
+`PADDLE_ENVIRONMENT`, `PADDLE_API_KEY`, `NEXT_PUBLIC_PADDLE_CLIENT_TOKEN`,
+`PADDLE_PRO_PRICE_ID`, or `PADDLE_WEBHOOK_SECRET` configured.
 
 ## Project structure
 

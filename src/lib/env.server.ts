@@ -24,4 +24,6 @@ export const serverEnv = {
   PADDLE_API_KEY: process.env.PADDLE_API_KEY,
   /** Server-only, not secret — the Paddle Price ID (pri_...) for ApproveGo Pro's monthly subscription. Not needed client-side: the browser only ever receives a transactionId. */
   PADDLE_PRO_PRICE_ID: process.env.PADDLE_PRO_PRICE_ID,
+  /** M10.3: secret — server-only. Signs/verifies inbound Paddle webhook deliveries for THIS notification destination. Never the same value as PADDLE_API_KEY. Never logged. */
+  PADDLE_WEBHOOK_SECRET: process.env.PADDLE_WEBHOOK_SECRET,
 } as const;
