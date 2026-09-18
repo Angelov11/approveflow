@@ -46,7 +46,7 @@ export async function POST(request: NextRequest) {
   const workspace = await timer.time("db", "getUsableInstallation", () => getUsableInstallation(slackTeamId));
   if (!workspace) {
     timer.ack("not_installed");
-    return ephemeral("ApproveFlow isn't installed for this workspace right now. Ask an admin to (re)install it from the ApproveFlow home page.");
+    return ephemeral("ApproveGo isn't installed for this workspace right now. Ask an admin to (re)install it from the ApproveGo home page.");
   }
 
   try {

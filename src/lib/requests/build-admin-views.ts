@@ -50,7 +50,7 @@ export function buildManageAdministratorsView(admins: AdminRow[], banner?: strin
         value: admin.slackUserId,
         confirm: {
           title: { type: "plain_text", text: "Remove administrator?" },
-          text: { type: "mrkdwn", text: `Remove <@${admin.slackUserId}> as an ApproveFlow administrator? This can't be the last administrator.` },
+          text: { type: "mrkdwn", text: `Remove <@${admin.slackUserId}> as an ApproveGo administrator? This can't be the last administrator.` },
           confirm: { type: "plain_text", text: "Remove" },
           deny: { type: "plain_text", text: "Cancel" },
         },
@@ -101,7 +101,7 @@ export function buildAddAdministratorModal(): ModalView {
 export function buildAdminErrorView(message: string): ModalView {
   return {
     type: "modal",
-    title: { type: "plain_text", text: "ApproveFlow" },
+    title: { type: "plain_text", text: "ApproveGo" },
     close: { type: "plain_text", text: "Close" },
     blocks: [{ type: "section", text: { type: "mrkdwn", text: message } }],
   } as ModalView;

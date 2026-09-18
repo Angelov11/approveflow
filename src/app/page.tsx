@@ -12,9 +12,9 @@ export default function Home() {
         gap: "0.5rem",
       }}
     >
-      <h1>ApproveFlow</h1>
-      <p>Request. Approve. Audit.</p>
-      <p>All from Slack.</p>
+      <h1>ApproveGo</h1>
+      <p>Simple approvals for Slack.</p>
+      <p>Request. Approve. Move on.</p>
       <a
         href="/api/slack/install"
         style={{

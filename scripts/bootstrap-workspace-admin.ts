@@ -101,7 +101,7 @@ async function main() {
   if (grantError) fail(`Granting admin: ${grantError.message}`);
 
   // Safe confirmation only — never the workspace row's token columns.
-  console.log(`Granted ApproveFlow admin to ${adminSlackUserId} in workspace ${slackTeamId} (workspace id ${workspace.id}). Safe to re-run.`);
+  console.log(`Granted ApproveGo admin to ${adminSlackUserId} in workspace ${slackTeamId} (workspace id ${workspace.id}). Safe to re-run.`);
 }
 
 main().catch((error) => fail(error instanceof Error ? error.message : "unknown error"));

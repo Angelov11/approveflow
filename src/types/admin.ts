@@ -26,7 +26,8 @@ export type ConfigureApprovalPolicyOutcome =
   | "duplicate_approvers"
   | "no_approvers"
   | "threshold_exceeds_approvers"
-  | "invalid_approver";
+  | "invalid_approver"
+  | "pro_required";
 
 export interface ConfigureApprovalPolicyResult {
   policy_id: string | null;

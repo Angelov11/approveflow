@@ -13,8 +13,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "ApproveFlow",
-  description: "Request. Approve. Audit. All from Slack.",
+  title: "ApproveGo — Simple approvals for Slack",
+  description: "Request. Approve. Move on.",
 };
 
 export default function RootLayout({ children }: LayoutProps<"/">) {

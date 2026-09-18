@@ -22,12 +22,12 @@ export default async function SlackInstalledPage({
       {succeeded ? (
         <>
           <h1>You&apos;re connected</h1>
-          <p>ApproveFlow has been successfully connected to Slack.</p>
+          <p>ApproveGo has been successfully connected to Slack.</p>
         </>
       ) : (
         <>
           <h1>Installation failed</h1>
-          <p>ApproveFlow could not be connected to Slack. Please try again.</p>
+          <p>ApproveGo could not be connected to Slack. Please try again.</p>
         </>
       )}
     </main>

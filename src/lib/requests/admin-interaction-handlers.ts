@@ -166,7 +166,7 @@ export async function handleAddAdministratorSubmission(payload: AddAdministrator
   const workspace = await timer.time("db", "findWorkspace", () => findWorkspaceBySlackTeamId(slackTeamId));
   if (!workspace) {
     timer.ack("workspace_not_found");
-    return modalErrors({ [ADD_ADMINISTRATOR_BLOCK_ID]: "ApproveFlow isn't installed for this workspace anymore." });
+    return modalErrors({ [ADD_ADMINISTRATOR_BLOCK_ID]: "ApproveGo isn't installed for this workspace anymore." });
   }
   if (!(await timer.time("db", "isWorkspaceAdmin", () => isWorkspaceAdmin(workspace.id, slackUserId)))) {
     timer.ack("unauthorized");
@@ -356,6 +356,8 @@ function describePolicyOutcome(outcome: ConfigureApprovalPolicyOutcome): string 
       return "Required approvals can't exceed the number of selected approvers.";
     case "invalid_approver":
       return "One of the selected approvers could not be verified.";
+    case "pro_required":
+      return "This workspace needs ApproveGo Pro to activate an approval policy.";
     default:
       return "Something went wrong saving this policy. Please try again.";
   }
@@ -374,7 +376,7 @@ export async function handlePolicySubmission(payload: PolicySubmissionPayload, t
   const workspace = await timer.time("db", "findWorkspace", () => findWorkspaceBySlackTeamId(slackTeamId));
   if (!workspace) {
     timer.ack("workspace_not_found");
-    return modalErrors({ [POLICY_APPROVERS_BLOCK_ID]: "ApproveFlow isn't installed for this workspace anymore." });
+    return modalErrors({ [POLICY_APPROVERS_BLOCK_ID]: "ApproveGo isn't installed for this workspace anymore." });
   }
   if (!(await timer.time("db", "isWorkspaceAdmin", () => isWorkspaceAdmin(workspace.id, slackUserId)))) {
     timer.ack("unauthorized");

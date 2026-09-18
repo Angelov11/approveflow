@@ -20,7 +20,7 @@ const sampleRequest: RequestSummary = {
 test("shows the product intro/tagline and Create Request as the sole top-level action", () => {
   const view = buildAppHomeView({  recentRequests: [], myRequestsTotalCount: 0, waitingCount: 0 , isAdmin: false });
   const text = blocksToText(view);
-  assert.ok(text.includes("ApproveFlow"));
+  assert.ok(text.includes("ApproveGo"));
   assert.ok(text.includes("create_request_home"));
   assert.ok(text.includes("Create Request"));
 });

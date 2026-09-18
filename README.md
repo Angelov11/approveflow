@@ -1,6 +1,6 @@
-# ApproveFlow
+# ApproveGo
 
-**ApproveFlow is lightweight employee/workplace approvals in Slack.** It
+**ApproveGo is lightweight employee/workplace approvals in Slack.** It
 solves "I need approval for something at work" — vacation and time off,
 doctor appointments, working from home, personal time, schedule changes,
 expenses and purchases, or anything else — not infrastructure access
@@ -9,7 +9,7 @@ provisioning. A requester describes what they need and picks an approver
 decides right in Slack; the requester is notified; the full history is
 always available from `/requests` or the App Home tab.
 
-**ApproveFlow is explicitly NOT:** an AWS/IAM access-provisioning product,
+**ApproveGo is explicitly NOT:** an AWS/IAM access-provisioning product,
 an HRIS, a PTO-balance or leave-accrual system, or a calendar. It never
 asks for or stores any third-party infrastructure credentials (AWS, GitHub,
 Google Workspace, Okta, or otherwise), and it never provisions or revokes
@@ -21,13 +21,13 @@ simpler, more universal workplace-approvals scope instead.
 ## Current milestone: M9 — Workspace Administration & Approval Policy Management
 
 M9 answers a question the product had never actually addressed: *who* is
-allowed to configure ApproveFlow for a workspace? Every prior milestone
+allowed to configure ApproveGo for a workspace? Every prior milestone
 treated every Slack user identically. M9 adds a minimal administration
 model — explicit **ADMIN** grants only, no separate MEMBER role, no
 organizations/teams/departments — and exposes the existing (unchanged)
 M3/M4 approval-policy engine through Slack-native "Manage Approval
 Policies"/"Manage Administrators" surfaces on the App Home tab, visible
-only to admins. The first person to install ApproveFlow into a workspace
+only to admins. The first person to install ApproveGo into a workspace
 becomes its initial admin automatically, identified from Slack's own
 `authed_user.id` (never the bot's own identity, never a client-supplied
 value); a *reinstall* of an already-known workspace never grants admin
@@ -114,7 +114,7 @@ Comments architecture](#m7-decision-comments-architecture) below.
 ## Previously: M6 — Slack App Home
 
 M6 added a persistent **App Home** tab and made it the **primary navigation
-surface** for ApproveFlow. Opening the Home tab shows a short intro, a
+surface** for ApproveGo. Opening the Home tab shows a short intro, a
 single top-level **Create Request** button, a "My Requests" summary (your 3
 most recent, plus a **View all requests** button that appears once there
 are more than 3 — opening the same Request Center `/requests` uses), and a
@@ -131,7 +131,7 @@ architecture](#m6-app-home-architecture) below.
 
 ## Previously: M5 — Slack Request History & Request Details
 
-M5 added `/requests`: a way to see your ApproveFlow activity without leaving
+M5 added `/requests`: a way to see your ApproveGo activity without leaving
 Slack. Running it opens a modal with two sections — **My Requests** (what
 you've submitted) and **Waiting for Me** (pending requests you're currently
 authorized to decide). Opening any request shows its full details, and if
@@ -145,13 +145,13 @@ M0 set up the application skeleton. M1 added Slack OAuth installation with
 encrypted bot-token storage. M2 added `/request`: a workspace member submits
 a request via a Slack modal, persisted with `PENDING` status. M3 added
 approval policies: an admin configures who must approve each request type,
-and ApproveFlow DMs them with Approve/Reject buttons.
+and ApproveGo DMs them with Approve/Reject buttons.
 
-**M4's product goal: ApproveFlow is now useful immediately after
+**M4's product goal: ApproveGo is now useful immediately after
 installation, with no configuration step required.** Structured approvals
 in Slack — request anything, pick an approver, get a decision in Slack:
 
-1. Install ApproveFlow
+1. Install ApproveGo
 2. Run `/request`
 3. Fill in Request Type, Resource, Reason, Duration, and pick an **Approver**
 4. Submit
@@ -161,7 +161,7 @@ in Slack — request anything, pick an approver, get a decision in Slack:
 No admin setup is required for this default path. M3's approval policies
 remain fully supported as an **optional, advanced** feature: if an admin
 has configured an active policy for a request type (see [Approval policy
-configuration](#approval-policy-configuration) below), ApproveFlow
+configuration](#approval-policy-configuration) below), ApproveGo
 automatically uses that policy instead of the manually selected approver.
 Policy routing always takes precedence — a requester's pick can never
 override configured company policy.
@@ -238,7 +238,7 @@ Manual steps you need to perform in the Slack dashboard — nothing here is
 automated.
 
 1. Go to https://api.slack.com/apps and click **Create New App** → **From
-   scratch**. Pick a name (e.g. "ApproveFlow") and your development
+   scratch**. Pick a name (e.g. "ApproveGo") and your development
    workspace.
 2. Open **OAuth & Permissions** in the sidebar:
    - Under **Redirect URLs**, add:
@@ -379,7 +379,7 @@ I have not modified your Slack app configuration myself.
 2. **Features → Slash Commands** → **Create New Command** (M5):
    - Command: `/requests`
    - Request URL: `<APP_URL>/api/slack/commands/requests`
-   - Short description: e.g. "View your ApproveFlow requests"
+   - Short description: e.g. "View your ApproveGo requests"
 3. **Features → Interactivity & Shortcuts**:
    - Turn Interactivity **On**
    - Request URL: `<APP_URL>/api/slack/interactions` (same URL handles `/request` submissions, `/requests` navigation, and Approve/Reject — see [M5: /requests architecture](#m5-requests-architecture))
@@ -487,12 +487,12 @@ a separate durable job.
 
 ## Approval policy configuration (optional, M3)
 
-**This is optional.** As of M4, ApproveFlow works with zero configuration —
+**This is optional.** As of M4, ApproveGo works with zero configuration —
 requesters pick an approver directly in the modal. Configure a policy only
 if you want a request type to always route to a fixed set of approvers
 regardless of who submits it, or to require more than one approval.
 
-**As of M9, this is also available Slack-natively** — an ApproveFlow admin
+**As of M9, this is also available Slack-natively** — an ApproveGo admin
 can open App Home → Administration → "Manage Approval Policies" and
 configure/edit/disable a policy for any of the 7 active request types
 without touching a terminal at all (see [M9: Workspace Administration &
@@ -1217,7 +1217,7 @@ POLICY request in the workspace (from prior M4/M5 testing).
 ### Test A — first open, empty state
 
 On an account that has never submitted a request and has nothing pending:
-open the **Home** tab in the ApproveFlow app.
+open the **Home** tab in the ApproveGo app.
 
 - Intro/tagline and a single top-level **Create Request** button render —
   there is no top-level "Open Request Center" button.
@@ -1278,7 +1278,7 @@ On an account with **more than 3** requests submitted: open Home.
 
 ### Test F — cross-workspace / uninstalled safety
 
-1. If you have a second ApproveFlow-installed workspace, open Home there —
+1. If you have a second ApproveGo-installed workspace, open Home there —
    its data must be completely independent (no bleed-through of the first
    workspace's requests/counts).
 2. Manually send a `url_verification` request with a correct signature but
@@ -1698,7 +1698,7 @@ Block Kit element:
 All four are stored as literal local values — a `date` string
 ("2026-09-21") and a `time` string ("10:00") — exactly as the requester
 picked them, in `requested_start_date`/`requested_start_time`/
-`requested_end_date`/`requested_end_time`. **ApproveFlow performs no
+`requested_end_date`/`requested_end_time`. **ApproveGo performs no
 timezone conversion of any kind, on read or write.** This app has no
 reliable per-employee or per-workspace timezone model, so DATE/TIME
 (not `timestamptz`) was a deliberate choice: storing an absolute instant
@@ -2097,7 +2097,7 @@ against production. The procedure below was executed as written.
 ### Fresh-workspace zero-config journey (separate — after the above)
 
 Cannot be run against the existing production workspace; requires
-installing ApproveFlow into a genuinely separate Slack workspace. Install →
+installing ApproveGo into a genuinely separate Slack workspace. Install →
 open Home → Create Request → confirm all 7 defaults appear immediately
 with zero SQL/script/manual Supabase setup → submit a DIRECT request →
 approver decides → requester notified.
@@ -2424,7 +2424,7 @@ latency to before M8.1 if possible.
 1. Confirm the existing workspace is `INSTALLED` (`select
    installation_status from workspaces`).
 2. Create a request — still works.
-3. Uninstall ApproveFlow from Slack's app management page.
+3. Uninstall ApproveGo from Slack's app management page.
 4. Confirm `app_uninstalled` arrives and `installation_status` becomes
    `UNINSTALLED`, `uninstalled_at` is set, and all three bot token columns
    are `NULL`.
@@ -2433,7 +2433,7 @@ latency to before M8.1 if possible.
 
 ### Test D — reinstall
 
-6. Reinstall ApproveFlow through the OAuth flow.
+6. Reinstall ApproveGo through the OAuth flow.
 7. Confirm the **same** `workspaces.id` row is reused (compare the UUID
    before/after).
 8. Confirm a new encrypted bot token is stored, `installation_status` is
@@ -2669,6 +2669,115 @@ at a time, and building new infrastructure just to prove it wasn't
 warranted; the concurrency guarantee rests on Postgres's own documented
 `INSERT ... ON CONFLICT` and row-locking semantics at the default `READ
 COMMITTED` isolation level, not on anything project-specific.
+
+## M10.1: Billing Schema Foundation & Pro Entitlements (implemented locally — not yet migrated to production)
+
+### Scope: schema + entitlement resolver only
+
+M10 is Paddle Billing for Free/Pro workspace entitlements, split into
+phases; **M10.1 is schema and read-side foundation only.** It does not
+implement webhook processing, checkout, a Paddle API client, Slack billing
+buttons, the Customer Portal, or the Paddle product/price catalog itself —
+all of that is deferred to later M10.x phases, pending separate
+authorization. Pricing is confirmed as **FREE $0/workspace** and **PRO
+$19/workspace/month** (no annual plan yet), but no code in this repo
+creates, charges, or checks out a Paddle subscription yet.
+
+Free is technically unmetered today — there is no request-quota
+enforcement anywhere in this codebase — but that is deliberately **not**
+treated as a guaranteed entitlement. Nothing in the schema, types, or
+entitlement logic below assumes permanent unlimited Free usage, and Free
+is never advertised as "unlimited." Quota/metering design is out of scope
+for M10.1 entirely.
+
+### `workspace_subscriptions` and `billing_webhook_events`
+
+One additive migration,
+`supabase/migrations/20260918020000_add_billing_entitlements.sql` — none
+of the 18 pre-M10.1 migrations are touched. `workspace_subscriptions`
+holds one row per workspace's current Paddle subscription; **a workspace
+with no row is simply Free** (there is no explicit FREE row ever
+inserted). `billing_webhook_events` is a `(provider, provider_event_id)`
+idempotency/audit ledger for a future webhook handler — it stores no raw
+payload and no payment/customer personal data. Both tables have row level
+security enabled with **no** policies for `anon`/`authenticated`: every
+access is server-side via the service role, the same posture as
+`workspace_admins`. Neither table is written by any code path today —
+they exist purely as the target schema for a future webhook handler.
+
+Nullability was decided per-column rather than defaulting to `NOT NULL`
+everywhere: identity/entitlement-critical columns
+(`workspace_id`, `provider`, `provider_subscription_id`,
+`provider_customer_id`, `plan`, `status`, `last_event_occurred_at`) are
+`NOT NULL`, since a row is only ever created FROM a real webhook event
+that already carries all of them. Columns Paddle can legitimately omit for
+a given subscription state, or that no entitlement/routing logic in this
+app ever reads — `provider_price_id`, `current_period_start`,
+`current_period_end`, `scheduled_change_action`,
+`scheduled_change_effective_at` — are nullable. See the migration file's
+own header comment for the full column-by-column reasoning.
+
+### Entitlement model
+
+- `isEntitledToPro(subscription)` (`src/lib/billing/entitlements.ts`) — a
+  pure predicate, no database dependency, same "pure function behind a
+  DB-touching wrapper" pattern as `isBotAdminCandidate`/
+  `computeRequestRoutingDecision`. A workspace is entitled when
+  `plan === 'PRO'` and `status` is `active`, `trialing`, or `past_due`
+  (Paddle's own guidance: customers should keep full access while a
+  payment retries). `paused` and `canceled` are never entitled. It
+  **never** inspects `scheduled_change_effective_at` — Paddle keeps
+  `status` itself accurate through a scheduled cancellation (`status`
+  stays `active` until the actual period boundary), so a subscription
+  with a scheduled-but-not-yet-effective cancellation is still entitled.
+- `computeWorkspaceCapabilities(entitledToPro)` — the pure FREE/PRO
+  capability mapping. Every capability maps 1:1 to Pro entitlement today
+  (there is no intermediate tier): `{ plan, canManageApprovalPolicies,
+  canUsePolicyRouting, canUseMultiApproverPolicies,
+  canUseApprovalThresholds }` — deliberately no request-limit/quota
+  fields.
+- `findWorkspaceSubscription(workspaceId)`
+  (`src/lib/billing/workspace-subscriptions.ts`) — the DB read, returning
+  `null` for a Free workspace.
+- `getWorkspaceEntitlements(workspaceId)`
+  (`src/lib/billing/workspace-entitlements.ts`) — the single, centralized
+  resolver application code should call: combines the DB read with the
+  two pure functions above.
+
+### `configure_approval_policy`: DB-level Pro defense-in-depth
+
+The same RPC from M9 (`CREATE OR REPLACE`, identical signature, the
+`#variable_conflict use_column` fix from
+`20260918010000_fix_workspace_admin_rpc_column_ambiguity.sql` carried
+forward unchanged) gains exactly one new check: when `p_active = true`, it
+now requires an entitled `workspace_subscriptions` row for the workspace,
+returning `'pro_required'` (via this RPC's existing null-id-plus-outcome
+convention) otherwise. This is **defense-in-depth**, not a replacement for
+authorization — Node's `isWorkspaceAdmin()` check still runs first, before
+this function is ever called.
+
+**Disabling a policy (`p_active = false`) is never gated** — it always
+succeeds regardless of billing status, so a workspace that downgrades or
+lets its subscription lapse can always turn its own policy off.
+`decide_on_request()` gains **no** entitlement check at all: an
+already-pending POLICY-routed request must remain completable after any
+future downgrade, and "effective policy" resolution (an active policy
+only actually *routes new requests* once its workspace is entitled) is
+application-level work deferred to a later M10.x phase —
+`interactions/route.ts` is untouched by M10.1, so current request-routing
+behavior does not change. Production's existing pre-billing "Production
+Access Approval" policy is likewise untouched: this check only applies to
+*future* `configure_approval_policy(p_active=true)` calls, never
+retroactively to rows already written.
+
+### Status: not yet migrated, not yet deployed
+
+The migration above, the billing types/lib modules, and their tests are
+implemented in this repo, but the migration has **not** been applied to
+any database, and none of it has been exercised against production — that
+requires the same controlled-verification checkpoint M9 went through
+before its migration was approved. No Paddle dependency, API call,
+catalog, or environment secret exists anywhere in this repo yet.
 
 ## Project structure
 

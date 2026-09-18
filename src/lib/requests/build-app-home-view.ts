@@ -39,7 +39,7 @@ export function buildAppHomeView({ recentRequests, myRequestsTotalCount, waiting
       type: "section",
       text: {
         type: "mrkdwn",
-        text: "*ApproveFlow*\nSimple workplace approvals in Slack. Request time off, schedule changes, purchases, and more — without leaving Slack.",
+        text: "*ApproveGo*\nSimple approvals for Slack. Request time off, schedule changes, purchases, and more — without leaving Slack.",
       },
     },
     {
@@ -98,7 +98,7 @@ export function buildAppHomeView({ recentRequests, myRequestsTotalCount, waiting
       },
       {
         type: "section",
-        text: { type: "mrkdwn", text: "*Administrators*\nManage who can configure ApproveFlow." },
+        text: { type: "mrkdwn", text: "*Administrators*\nManage who can configure ApproveGo." },
         accessory: { type: "button", action_id: MANAGE_ADMINISTRATORS_ACTION_ID, text: { type: "plain_text", text: "Manage Administrators" } },
       },
     );

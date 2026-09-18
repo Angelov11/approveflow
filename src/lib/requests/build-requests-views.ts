@@ -19,7 +19,7 @@ export function buildErrorView(message: string): ModalView {
   return {
     type: "modal",
     callback_id: REQUEST_DETAILS_CALLBACK_ID,
-    title: { type: "plain_text", text: "ApproveFlow" },
+    title: { type: "plain_text", text: "ApproveGo" },
     close: { type: "plain_text", text: "Close" },
     blocks: [{ type: "section", text: { type: "mrkdwn", text: message } }],
   } as ModalView;
@@ -147,7 +147,7 @@ export function buildRequestCenterView({ myRequests, myRequestsTotalCount, waiti
   return {
     type: "modal",
     callback_id: REQUEST_CENTER_CALLBACK_ID,
-    title: { type: "plain_text", text: "ApproveFlow" },
+    title: { type: "plain_text", text: "ApproveGo" },
     close: { type: "plain_text", text: "Close" },
     blocks,
   } as ModalView;

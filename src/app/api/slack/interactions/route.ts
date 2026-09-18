@@ -232,7 +232,7 @@ async function handleRequestSubmission(payload: ViewSubmissionPayload, timer: Re
   const workspace = await timer.time("db", "findWorkspace", () => findWorkspaceBySlackTeamId(slackTeamId));
   if (!workspace) {
     timer.ack("workspace_not_found");
-    return modalErrors({ request_type_block: "ApproveFlow isn't installed for this workspace anymore." });
+    return modalErrors({ request_type_block: "ApproveGo isn't installed for this workspace anymore." });
   }
 
   const requestTypes = await timer.time("db", "listActiveRequestTypes", () => listActiveRequestTypes(workspace.id));
@@ -701,7 +701,7 @@ async function handleDecisionSubmission(payload: DecisionSubmissionPayload, deci
   const workspace = await timer.time("db", "findWorkspace", () => findWorkspaceBySlackTeamId(slackTeamId));
   if (!workspace) {
     timer.ack("workspace_not_found");
-    return modalUpdate(buildErrorView("ApproveFlow isn't installed for this workspace anymore."));
+    return modalUpdate(buildErrorView("ApproveGo isn't installed for this workspace anymore."));
   }
 
   let approverId: string;
