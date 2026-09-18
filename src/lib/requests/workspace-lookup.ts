@@ -15,6 +15,17 @@ export async function findWorkspaceBySlackTeamId(slackTeamId: string): Promise<W
   return data;
 }
 
+/** M10.2: looks up a workspace by its internal UUID — used by the billing-session checkout page, which only ever carries a workspace_id (verified inside a signed token), never a Slack team ID. Returns null for an unknown or since-deleted workspace. */
+export async function findWorkspaceById(workspaceId: string): Promise<Workspace | null> {
+  const supabase = getSupabaseAdmin();
+  const { data, error } = await supabase.from("workspaces").select("*").eq("id", workspaceId).maybeSingle();
+
+  if (error) {
+    throw new Error(`Failed to look up workspace: ${error.message}`);
+  }
+  return data;
+}
+
 /** A Workspace known to have a decryptable bot token — see getUsableInstallation(). */
 export interface UsableWorkspace extends Workspace {
   bot_access_token_ciphertext: string;

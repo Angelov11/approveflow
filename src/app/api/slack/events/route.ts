@@ -3,6 +3,7 @@ import { after } from "next/server";
 import type { NextRequest } from "next/server";
 import type { SupabaseClient } from "@supabase/supabase-js";
 
+import { getWorkspaceEntitlements } from "@/lib/billing/workspace-entitlements";
 import { serverEnv } from "@/lib/env.server";
 import { createRequestTimer, type RequestTimer } from "@/lib/observability/timing";
 import { buildAppHomeView, HOME_RECENT_REQUESTS_LIMIT } from "@/lib/requests/build-app-home-view";
@@ -39,15 +40,23 @@ async function publishHomeView(timer: RequestTimer, slackTeamId: string, slackUs
   // so there is no trigger_id/ack budget to protect here regardless; the
   // parallelization is purely to avoid an unnecessary extra sequential
   // stage even in the deferred path.
-  const [{ rows: recentRequests, totalCount: myRequestsTotalCount }, waitingRequests, isAdmin] = await timer.time("db", "listRequestsAndAdminStatusForHome", () =>
-    Promise.all([
-      listRequestsByRequester(workspace.id, viewer.id, HOME_RECENT_REQUESTS_LIMIT),
-      listRequestsWaitingForApprover(workspace.id, viewer.id),
-      isWorkspaceAdmin(workspace.id, slackUserId),
-    ]),
+  const [{ rows: recentRequests, totalCount: myRequestsTotalCount }, waitingRequests, isAdmin, entitlements] = await timer.time(
+    "db",
+    "listRequestsAndAdminStatusForHome",
+    () =>
+      Promise.all([
+        listRequestsByRequester(workspace.id, viewer.id, HOME_RECENT_REQUESTS_LIMIT),
+        listRequestsWaitingForApprover(workspace.id, viewer.id),
+        isWorkspaceAdmin(workspace.id, slackUserId),
+        // M10.2: cheap even for a non-admin viewer — Home always needs it to
+        // decide whether an admin sees Free or Pro billing copy, and this
+        // whole handler already runs inside after() with no ack budget to
+        // protect, so there's no correctness reason to gate it on isAdmin.
+        getWorkspaceEntitlements(workspace.id),
+      ]),
   );
 
-  const view = buildAppHomeView({ recentRequests, myRequestsTotalCount, waitingCount: waitingRequests.length, isAdmin });
+  const view = buildAppHomeView({ recentRequests, myRequestsTotalCount, waitingCount: waitingRequests.length, isAdmin, plan: entitlements.plan });
 
   const botToken = decryptBotToken({
     ciphertext: workspace.bot_access_token_ciphertext,

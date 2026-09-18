@@ -1,6 +1,7 @@
 import type { WebClient } from "@slack/web-api";
 
-import { MANAGE_ADMINISTRATORS_ACTION_ID, MANAGE_POLICIES_ACTION_ID } from "./build-admin-views.ts";
+import type { WorkspacePlan } from "../../types/billing.ts";
+import { MANAGE_ADMINISTRATORS_ACTION_ID, MANAGE_POLICIES_ACTION_ID, UPGRADE_TO_PRO_ACTION_ID } from "./build-admin-views.ts";
 import { buildRequestRowBlocks, type RequestSummary } from "./build-requests-views.ts";
 import { CREATE_REQUEST_ACTION_ID, OPEN_REQUEST_CENTER_ACTION_ID, VIEW_WAITING_REQUESTS_ACTION_ID } from "./parse-requests-action.ts";
 
@@ -18,6 +19,8 @@ export interface BuildAppHomeViewParams {
   waitingCount: number;
   /** M9: whether the viewer currently holds an admin grant for this workspace — resolved server-side (isWorkspaceAdmin) by the caller, never inferred here. Hiding the Administration section for a non-admin is UX only; every action inside it independently reauthorizes regardless of whether this flag was ever true. */
   isAdmin: boolean;
+  /** M10.2: resolved server-side via getWorkspaceEntitlements — never inferred here. Only rendered inside the admin-only Billing section; a non-admin never sees billing controls regardless of this value. */
+  plan: WorkspacePlan;
 }
 
 /**
@@ -33,7 +36,7 @@ export interface BuildAppHomeViewParams {
  * `origin` field) instead of pushed onto one already open. `/requests`
  * still opens this same Request Center directly, as a shortcut.
  */
-export function buildAppHomeView({ recentRequests, myRequestsTotalCount, waitingCount, isAdmin }: BuildAppHomeViewParams): HomeView {
+export function buildAppHomeView({ recentRequests, myRequestsTotalCount, waitingCount, isAdmin, plan }: BuildAppHomeViewParams): HomeView {
   const blocks: unknown[] = [
     {
       type: "section",
@@ -102,6 +105,23 @@ export function buildAppHomeView({ recentRequests, myRequestsTotalCount, waiting
         accessory: { type: "button", action_id: MANAGE_ADMINISTRATORS_ACTION_ID, text: { type: "plain_text", text: "Manage Administrators" } },
       },
     );
+
+    // M10.2: Free is technically unmetered today, but that's never rendered
+    // as "Unlimited" — see the M10 design notes. Upgrade only ever generates
+    // a signed billing-session URL here; it never calls Paddle itself (see
+    // handleUpgradeToPro in admin-interaction-handlers.ts).
+    if (plan === "PRO") {
+      blocks.push({ type: "section", text: { type: "mrkdwn", text: "*Billing*\nPro — $19/month per workspace." } });
+    } else {
+      blocks.push({
+        type: "section",
+        text: {
+          type: "mrkdwn",
+          text: "*Billing*\nFree\n\nApproval Policies are available on Pro.\n\nApproveGo Pro — $19/month per workspace",
+        },
+        accessory: { type: "button", action_id: UPGRADE_TO_PRO_ACTION_ID, style: "primary", text: { type: "plain_text", text: "Upgrade to Pro" } },
+      });
+    }
   }
 
   return { type: "home", blocks } as HomeView;

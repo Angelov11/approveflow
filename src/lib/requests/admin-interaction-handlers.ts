@@ -1,6 +1,10 @@
 import { WebClient } from "@slack/web-api";
 import { after } from "next/server";
 
+import { deriveBillingSessionSecret } from "../billing/billing-session-secret.ts";
+import { createBillingSessionToken } from "../billing/billing-session-token.ts";
+import { isBlockedFromNewCheckout } from "../billing/duplicate-subscription-guard.ts";
+import { findWorkspaceSubscription } from "../billing/workspace-subscriptions.ts";
 import {
   ADD_ADMINISTRATOR_BLOCK_ID,
   ADD_ADMINISTRATOR_SELECT_ACTION_ID,
@@ -8,8 +12,10 @@ import {
   buildAdminErrorView,
   buildManageAdministratorsView,
 } from "./build-admin-views.ts";
+import { buildBillingCheckoutModal } from "./build-billing-views.ts";
 import { buildPolicyModal, POLICY_APPROVERS_BLOCK_ID } from "./build-policy-modal.ts";
 import { buildManagePoliciesView } from "./build-policy-views.ts";
+import { serverEnv } from "../env.server.ts";
 import type { RequestTimer } from "../observability/timing.ts";
 import { configureApprovalPolicy, getPolicyForRequestType, listPolicySummaries } from "./policy-configuration.ts";
 import { validatePolicySubmission, type PolicySubmissionPayload } from "./validate-policy-submission.ts";
@@ -97,6 +103,67 @@ export async function handleManageAdministrators(payload: AdminBlockActionsPaylo
     await openView(workspace, timer, "open", triggerId, view);
   } catch (error) {
     console.error("Failed to open Manage Administrators:", error instanceof Error ? error.message : "unknown error");
+    timer.ack("error");
+    return ack();
+  }
+
+  timer.ack("opened");
+  return ack();
+}
+
+// --- Upgrade to Pro (App Home Billing section; trigger_id-bound) ---
+
+/**
+ * Never trusts that the Billing button being visible already proved
+ * anything — App Home showing "Free" for this viewer could be stale by
+ * the time they click. Re-resolves the workspace and re-authorizes via
+ * isWorkspaceAdmin() exactly like every other admin action here, THEN
+ * re-checks the duplicate-subscription guard fresh (never trusts whatever
+ * plan App Home last rendered). Never calls Paddle: this only generates a
+ * signed billing-session URL. The Paddle Transaction is created later,
+ * server-side, when that URL is opened (see /billing/checkout).
+ */
+export async function handleUpgradeToPro(payload: AdminBlockActionsPayload, timer: RequestTimer): Promise<Response> {
+  const slackTeamId = payload.team?.id;
+  const slackUserId = payload.user?.id;
+  const triggerId = payload.trigger_id;
+  if (!slackTeamId || !slackUserId || !triggerId) {
+    timer.ack("ignored");
+    return ack();
+  }
+
+  const workspace = await timer.time("db", "getUsableInstallation", () => getUsableInstallation(slackTeamId));
+  if (!workspace) {
+    timer.ack("not_installed");
+    return ack();
+  }
+  if (!(await timer.time("db", "isWorkspaceAdmin", () => isWorkspaceAdmin(workspace.id, slackUserId)))) {
+    timer.ack("unauthorized");
+    return ack();
+  }
+
+  try {
+    const existingSubscription = await timer.time("db", "findWorkspaceSubscription", () => findWorkspaceSubscription(workspace.id));
+    if (isBlockedFromNewCheckout(existingSubscription)) {
+      await openView(
+        workspace,
+        timer,
+        "open",
+        triggerId,
+        buildAdminErrorView("This workspace already has a billing subscription. Billing management will be available here."),
+      );
+      timer.ack("already_has_subscription");
+      return ack();
+    }
+
+    const secret = deriveBillingSessionSecret(serverEnv.SLACK_CLIENT_SECRET ?? "");
+    const token = createBillingSessionToken({ workspaceId: workspace.id, secret });
+    const checkoutUrl = new URL("/billing/checkout", serverEnv.NEXT_PUBLIC_APP_URL);
+    checkoutUrl.searchParams.set("session", token);
+
+    await openView(workspace, timer, "open", triggerId, buildBillingCheckoutModal(checkoutUrl.toString()));
+  } catch (error) {
+    console.error("Failed to open Upgrade to Pro:", error instanceof Error ? error.message : "unknown error");
     timer.ack("error");
     return ack();
   }

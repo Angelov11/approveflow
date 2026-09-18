@@ -2670,7 +2670,7 @@ warranted; the concurrency guarantee rests on Postgres's own documented
 `INSERT ... ON CONFLICT` and row-locking semantics at the default `READ
 COMMITTED` isolation level, not on anything project-specific.
 
-## M10.1: Billing Schema Foundation & Pro Entitlements (implemented locally — not yet migrated to production)
+## M10.1: Billing Schema Foundation & Pro Entitlements (deployed and production-verified)
 
 ### Scope: schema + entitlement resolver only
 
@@ -2770,14 +2770,187 @@ Access Approval" policy is likewise untouched: this check only applies to
 *future* `configure_approval_policy(p_active=true)` calls, never
 retroactively to rows already written.
 
-### Status: not yet migrated, not yet deployed
+### Status: migrated and dynamically verified against production
 
-The migration above, the billing types/lib modules, and their tests are
-implemented in this repo, but the migration has **not** been applied to
-any database, and none of it has been exercised against production — that
-requires the same controlled-verification checkpoint M9 went through
-before its migration was approved. No Paddle dependency, API call,
-catalog, or environment secret exists anywhere in this repo yet.
+`20260918020000_add_billing_entitlements.sql` has been applied to the
+linked production database (19/19 migrations, local and remote in sync).
+Both new tables exist, empty, with RLS enabled and no policies. The new
+`pro_required` branch was dynamically verified against the real
+"Production Access Approval" policy — calling `configure_approval_policy`
+with `p_active=true` and that policy's exact existing configuration
+returns `{policy_id: null, outcome: "pro_required"}` before touching any
+row, proven safe by the function's own control flow (the check is the
+first non-trivial statement in the body, and it always `return`s before
+reaching any `insert`/`update`/`delete`). A full before/after snapshot
+confirmed zero mutation. No Paddle dependency, API call, catalog, or
+environment secret existed anywhere in this repo as of M10.1 — see M10.2
+below for where that starts.
+
+## M10.2: Paddle Sandbox Catalog & Secure Checkout (Sandbox only — implemented locally, not yet committed)
+
+### Scope: checkout only — no webhooks, no entitlement grant
+
+The end-to-end flow this milestone builds: an ApproveGo workspace admin
+clicks **Upgrade to Pro** in App Home → a signed, short-lived billing
+URL → the ApproveGo checkout page → a server-created Paddle Transaction →
+Paddle Sandbox Checkout. It deliberately stops there. Webhook-driven
+entitlement sync (`/api/paddle/webhooks`, inserting
+`workspace_subscriptions` rows, actually granting Pro) is **M10.3**, not
+implemented here — a successful browser checkout in M10.2 grants nothing.
+Application-level policy-routing gating (M10.4) is likewise untouched:
+`interactions/route.ts` and `decide_on_request()` are unchanged, and the
+existing "Production Access Approval" policy keeps routing exactly as
+before.
+
+**Sandbox only.** Every Paddle object below belongs to the Sandbox
+environment (`sandbox-api.paddle.com`); Live has not been configured
+anywhere in this app.
+
+### Paddle Sandbox catalog
+
+One product, one price, created via the Paddle MCP server (`paddle-sandbox`)
+after confirming the catalog was empty:
+
+- Product **ApproveGo Pro** — `tax_category: saas` (Paddle's documented
+  category for SaaS subscriptions).
+- Price **Monthly** — $19.00 USD/month recurring (`billing_cycle: {interval:
+  "month", frequency: 1}`), `quantity: {minimum: 1, maximum: 1}` — enforced
+  at the Paddle catalog level, not just in application code, so a
+  tampered client request could never buy more than one seat-equivalent
+  unit even if it tried. No trial period, no setup fee, no annual price.
+- A Sandbox **client-side token** was created for Paddle.js.
+
+IDs are referenced only by environment-variable NAME below, never by
+value, per the M10 audit's privacy posture.
+
+### Environment configuration
+
+Four new variables (`src/lib/env.ts`, `src/lib/env.server.ts`,
+`.env.example`):
+
+| Variable | Public/secret | Purpose |
+| --- | --- | --- |
+| `PADDLE_ENVIRONMENT` | server-only, not secret | `"sandbox"` or `"live"` |
+| `PADDLE_API_KEY` | **secret**, server-only | Bearer auth for the Node SDK |
+| `NEXT_PUBLIC_PADDLE_CLIENT_TOKEN` | public, browser-safe | Paddle.js token |
+| `PADDLE_PRO_PRICE_ID` | server-only, not secret | The Sandbox price above |
+
+`PADDLE_PRO_PRODUCT_ID` was deliberately not added — no runtime code
+needs the product id, only the price id. `PADDLE_WEBHOOK_SECRET` was
+deliberately not added either — it's needed only once M10.3 creates a
+webhook destination.
+
+### Sandbox/live safety guard
+
+`validatePaddleEnvironmentConfig()`
+(`src/lib/billing/paddle-environment-guard.ts`) fails loudly (throws, via
+`getPaddleClient()`) if `PADDLE_ENVIRONMENT` doesn't match the credential
+prefixes Paddle itself uses to mark environment — confirmed against
+official Paddle documentation: server API keys are `pdl_sdbx_apikey_...`
+(sandbox) / `pdl_live_apikey_...` (live); Paddle.js client tokens are
+`test_...` (sandbox) / `live_...` (live). Pure function, unit tested for
+all six required sandbox/live × correct/wrong-credential combinations
+plus missing-value cases.
+
+### Billing-session token
+
+The checkout URL never carries a raw workspace UUID as a trusted
+parameter. `createBillingSessionToken`/`verifyBillingSessionToken`
+(`src/lib/billing/billing-session-token.ts`) sign `{workspaceId, exp}`
+with HMAC-SHA256 (constant-time comparison, same architecture as
+`verify-request.ts`'s Slack signature check) using a secret derived via
+`deriveBillingSessionSecret` (`src/lib/billing/billing-session-secret.ts`)
+— the same domain-separation pattern as `deriveOAuthStateSecret`
+(`src/lib/slack/state-secret.ts`), but with a brand new domain string, so
+a token signed for one purpose can never validate for the other. **TTL:
+15 minutes** — long enough for an admin to read App Home, click Upgrade,
+and complete an interactive checkout without the link expiring mid-flow;
+short enough to bound how long a leaked link stays useful.
+
+### Slack entry point: App Home Billing section
+
+Admins see a **Billing** section added to App Home's existing
+Administration area (`src/lib/requests/build-app-home-view.ts`) — Free
+shows "Approval Policies are available on Pro" + an **Upgrade to Pro**
+button; Pro shows plain status text, no button. Non-admins never see
+this section at all, the same visibility rule as the rest of
+Administration. Clicking Upgrade (`handleUpgradeToPro`,
+`src/lib/requests/admin-interaction-handlers.ts`) **never calls Paddle**
+— it re-resolves the workspace, re-authorizes via `isWorkspaceAdmin()`
+(never trusting that the button being visible already proved anything),
+re-checks the duplicate-subscription guard, and — only if not blocked —
+opens a modal with a plain external link to the checkout page. All of
+this runs synchronously before the Slack ack, matching the existing
+trigger_id-bound modal pattern (`views.open`) used by every other admin
+action; no Paddle API call is ever on this path, so M8.1's fast-ack
+architecture is never at risk.
+
+### Duplicate-subscription guard
+
+`isBlockedFromNewCheckout(subscription)`
+(`src/lib/billing/duplicate-subscription-guard.ts`) — checked
+independently in **two** places (the Slack-side Upgrade click, and again
+server-side on the checkout page itself; neither trusts the other).
+Blocks a new checkout for `active`, `trialing`, `past_due`, **and**
+`paused` — a paused subscription still exists in Paddle pointing at the
+same customer, so the correct action is to resume/manage it, not create a
+second one. Does **not** block `canceled` — Paddle subscriptions can
+never be reinstated once canceled (confirmed against official docs), so a
+new checkout is the only legitimate path forward for a previously-canceled
+workspace. There is no Customer Portal / Manage Billing UI yet (M10.4), so
+every blocked case shows the same placeholder: "This workspace already
+has a billing subscription. Billing management will be available here."
+
+### Checkout page: `/billing/checkout?session=<token>`
+
+A public route requiring no general ApproveGo login — trust comes
+entirely from the signed token. Server-side (`src/app/billing/checkout/page.tsx`):
+verify the token → resolve the workspace → re-check the duplicate guard
+→ create the Paddle Transaction server-side via the official Node SDK
+(`@paddle/paddle-node-sdk`, `src/lib/billing/create-pro-checkout-transaction.ts`)
+using `PADDLE_PRO_PRICE_ID`, `quantity: 1`, and `custom_data.workspace_id`
+— all set here, never accepted from the browser. Only the resulting
+`transactionId` is passed to the client component
+(`checkout-client.tsx`), which initializes Paddle.js
+(`@paddle/paddle-js`) for Sandbox and opens `Paddle.Checkout.open({
+transactionId })` — never with client-supplied `items`/price/quantity/
+`custom_data`.
+
+**Transaction idempotency:** Paddle's transaction-create API has no
+documented idempotency key or header (confirmed against the current API
+reference — none exists on this endpoint). No dedicated handling was
+built for a page refresh regardless: an unpaid `draft`/`ready`
+transaction has no real-world effect until a customer actually completes
+payment on it, and Paddle's own hosted checkout already creates a fresh
+draft transaction on every open by design. A refresh simply creates
+another harmless, unpaid transaction — deliberately not solved with a
+database checkout-session table, which would be complexity with no
+concrete safety benefit here.
+
+**Checkout completion is not an entitlement source.** `checkout.completed`
+firing in the browser only updates this page's own UI ("Payment received.
+ApproveGo is confirming your subscription.") — it never inserts into
+`workspace_subscriptions`, never calls `configure_approval_policy`, and
+never marks the workspace Pro. Until M10.3's verified webhook handler
+exists, `workspace_subscriptions` stays exactly as it is today (empty)
+even after a real Sandbox payment succeeds — this is expected, not a bug.
+
+### Paddle API client: official SDKs, not a hand-rolled fetch wrapper
+
+`@paddle/paddle-node-sdk` (server, `src/lib/billing/paddle-client.ts`) and
+`@paddle/paddle-js` (browser) — chosen over a custom fetch wrapper because
+they already handle auth headers, the sandbox-vs-production API base URL,
+and typed request/response shapes correctly, which is a better
+security/maintenance trade than reimplementing that by hand. No custom
+payment-provider abstraction layer sits on top of them.
+
+### Status: implemented locally, not committed
+
+The Sandbox catalog exists in Paddle and the code above is implemented
+and tested locally, but nothing in this section has been committed,
+pushed, or deployed yet — see the M10.2 review report for the full
+verification trail (tests/lint/build, and the exact production-safety
+review) before that happens.
 
 ## Project structure
 
