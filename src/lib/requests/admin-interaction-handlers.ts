@@ -157,7 +157,7 @@ export async function handleUpgradeToPro(payload: AdminBlockActionsPayload, time
     }
 
     const secret = deriveBillingSessionSecret(serverEnv.SLACK_CLIENT_SECRET ?? "");
-    const token = createBillingSessionToken({ workspaceId: workspace.id, secret });
+    const token = createBillingSessionToken({ workspaceId: workspace.id, purpose: "checkout", secret });
     const checkoutUrl = new URL("/billing/checkout", serverEnv.NEXT_PUBLIC_APP_URL);
     checkoutUrl.searchParams.set("session", token);
 
@@ -208,7 +208,7 @@ export async function handleManageBilling(payload: AdminBlockActionsPayload, tim
     }
 
     const secret = deriveBillingSessionSecret(serverEnv.SLACK_CLIENT_SECRET ?? "");
-    const token = createBillingSessionToken({ workspaceId: workspace.id, secret });
+    const token = createBillingSessionToken({ workspaceId: workspace.id, purpose: "manage_billing", secret });
     const manageBillingUrl = new URL("/billing/manage", serverEnv.NEXT_PUBLIC_APP_URL);
     manageBillingUrl.searchParams.set("session", token);
 

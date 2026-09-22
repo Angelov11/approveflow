@@ -42,7 +42,7 @@ export default async function BillingManagePage({ searchParams }: { searchParams
   }
 
   const secret = deriveBillingSessionSecret(serverEnv.SLACK_CLIENT_SECRET ?? "");
-  const verification = verifyBillingSessionToken(session, secret);
+  const verification = verifyBillingSessionToken(session, "manage_billing", secret);
   if (!verification.valid) {
     return <ErrorPage message="This billing link is invalid or has expired. Please generate a new one from Slack." />;
   }

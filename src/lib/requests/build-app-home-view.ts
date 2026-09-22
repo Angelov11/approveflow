@@ -1,5 +1,6 @@
 import type { WebClient } from "@slack/web-api";
 
+import type { BillingActions } from "../billing/billing-actions.ts";
 import type { WorkspacePlan } from "../../types/billing.ts";
 import { MANAGE_ADMINISTRATORS_ACTION_ID, MANAGE_BILLING_ACTION_ID, MANAGE_POLICIES_ACTION_ID, UPGRADE_TO_PRO_ACTION_ID } from "./build-admin-views.ts";
 import { buildRequestRowBlocks, type RequestSummary } from "./build-requests-views.ts";
@@ -19,8 +20,16 @@ export interface BuildAppHomeViewParams {
   waitingCount: number;
   /** M9: whether the viewer currently holds an admin grant for this workspace — resolved server-side (isWorkspaceAdmin) by the caller, never inferred here. Hiding the Administration section for a non-admin is UX only; every action inside it independently reauthorizes regardless of whether this flag was ever true. */
   isAdmin: boolean;
-  /** M10.2: resolved server-side via getWorkspaceEntitlements — never inferred here. Only rendered inside the admin-only Billing section; a non-admin never sees billing controls regardless of this value. */
+  /**
+   * M10.2: resolved server-side via getWorkspaceBillingState — never inferred
+   * here. Only used inside the admin-only Billing section for the status
+   * label ("Pro"/"Free"); which BUTTONS are shown is governed separately by
+   * `billingActions` below. Product entitlement and billing-action
+   * visibility are deliberately different concepts — see billing-actions.ts.
+   */
   plan: WorkspacePlan;
+  /** M10.3: which billing buttons to show — independent of `plan`. See billing-actions.ts for why a paused/canceled workspace (plan === "FREE") can still show "Manage Billing", and canceled can show both buttons. */
+  billingActions: BillingActions;
 }
 
 /**
@@ -36,7 +45,7 @@ export interface BuildAppHomeViewParams {
  * `origin` field) instead of pushed onto one already open. `/requests`
  * still opens this same Request Center directly, as a shortcut.
  */
-export function buildAppHomeView({ recentRequests, myRequestsTotalCount, waitingCount, isAdmin, plan }: BuildAppHomeViewParams): HomeView {
+export function buildAppHomeView({ recentRequests, myRequestsTotalCount, waitingCount, isAdmin, plan, billingActions }: BuildAppHomeViewParams): HomeView {
   const blocks: unknown[] = [
     {
       type: "section",
@@ -106,14 +115,46 @@ export function buildAppHomeView({ recentRequests, myRequestsTotalCount, waiting
       },
     );
 
-    // M10.2: Free is technically unmetered today, but that's never rendered
-    // as "Unlimited" — see the M10 design notes. Upgrade only ever generates
-    // a signed billing-session URL here; it never calls Paddle itself (see
-    // handleUpgradeToPro in admin-interaction-handlers.ts).
+    // M10.2/M10.3: Free is technically unmetered today, but that's never
+    // rendered as "Unlimited" — see the M10 design notes. Upgrade and Manage
+    // Billing only ever generate a signed billing-session URL here; neither
+    // calls Paddle itself (see handleUpgradeToPro/handleManageBilling in
+    // admin-interaction-handlers.ts). Which buttons appear is governed by
+    // billingActions, NOT by plan — a paused or canceled workspace is Free
+    // for product-feature purposes (plan === "FREE") but may still have a
+    // real billing relationship worth surfacing. See billing-actions.ts.
     if (plan === "PRO") {
       blocks.push({
         type: "section",
         text: { type: "mrkdwn", text: "*Billing*\nPro — $19/month per workspace." },
+        accessory: { type: "button", action_id: MANAGE_BILLING_ACTION_ID, text: { type: "plain_text", text: "Manage Billing" } },
+      });
+    } else if (billingActions.canManageBilling && billingActions.canUpgrade) {
+      // Canceled: checkout rules already allow resubscribing, so don't force
+      // a choice between billing history and resubscribing — show both.
+      blocks.push(
+        {
+          type: "section",
+          text: {
+            type: "mrkdwn",
+            text: "*Billing*\nFree — your Pro subscription was canceled.\n\nApproval Policies are available on Pro.\n\nApproveGo Pro — $19/month per workspace",
+          },
+        },
+        {
+          type: "actions",
+          block_id: "home_billing_actions",
+          elements: [
+            { type: "button", action_id: MANAGE_BILLING_ACTION_ID, text: { type: "plain_text", text: "Manage Billing" } },
+            { type: "button", action_id: UPGRADE_TO_PRO_ACTION_ID, style: "primary", text: { type: "plain_text", text: "Upgrade Again" } },
+          ],
+        },
+      );
+    } else if (billingActions.canManageBilling) {
+      // Paused: checkout would reject a new attempt anyway (the duplicate-
+      // subscription guard blocks it), so only offer Manage Billing.
+      blocks.push({
+        type: "section",
+        text: { type: "mrkdwn", text: "*Billing*\nFree — your subscription is paused.\n\nApproval Policies are available on Pro." },
         accessory: { type: "button", action_id: MANAGE_BILLING_ACTION_ID, text: { type: "plain_text", text: "Manage Billing" } },
       });
     } else {

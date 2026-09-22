@@ -1,23 +1,37 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 
 /**
- * Signed, short-lived token carrying a workspace_id into the checkout
- * page's URL, so the raw UUID is never a trusted-by-itself URL parameter —
- * the checkout route must verify this signature and expiry before
+ * Signed, short-lived token carrying a workspace_id into a billing page's
+ * URL, so the raw UUID is never a trusted-by-itself URL parameter — the
+ * receiving route must verify this signature, purpose, and expiry before
  * resolving the workspace at all. Same architecture as
  * src/lib/slack/verify-request.ts (constant-time comparison, injectable
  * `nowSeconds` for deterministic tests), applied to a signed payload
  * instead of a raw-body signature.
  *
  * 15 minutes: long enough for an admin to read the App Home billing
- * section, click Upgrade, and complete an interactive Paddle Checkout
- * without the link expiring mid-flow, short enough to bound how long a
- * leaked/forwarded link stays useful.
+ * section, click a billing action, and complete it interactively (e.g. a
+ * Paddle Checkout) without the link expiring mid-flow, short enough to
+ * bound how long a leaked/forwarded link stays useful.
+ *
+ * `purpose` exists specifically so a token minted for one billing flow can
+ * never authorize a different, more sensitive one — e.g. a checkout link
+ * (generated while a workspace has no subscription) must never also work
+ * as a Manage Billing link if that workspace later acquires one before
+ * the link expires, and a Manage Billing link must never authorize
+ * starting a brand new checkout. This is enforced structurally (the
+ * verifier requires the caller's expected purpose to match exactly), not
+ * merely by the two routes happening to have different URLs.
  */
 export const BILLING_SESSION_TOKEN_TTL_SECONDS = 15 * 60;
 
+export type BillingSessionPurpose = "checkout" | "manage_billing";
+
+const VALID_PURPOSES: ReadonlySet<string> = new Set<BillingSessionPurpose>(["checkout", "manage_billing"]);
+
 interface BillingSessionPayload {
   workspaceId: string;
+  purpose: BillingSessionPurpose;
   exp: number;
 }
 
@@ -35,6 +49,7 @@ function base64UrlDecode(input: string): string | null {
 
 export interface CreateBillingSessionTokenParams {
   workspaceId: string;
+  purpose: BillingSessionPurpose;
   secret: string;
   /** Injectable for deterministic tests. */
   nowSeconds?: number;
@@ -43,11 +58,12 @@ export interface CreateBillingSessionTokenParams {
 
 export function createBillingSessionToken({
   workspaceId,
+  purpose,
   secret,
   nowSeconds = Math.floor(Date.now() / 1000),
   ttlSeconds = BILLING_SESSION_TOKEN_TTL_SECONDS,
 }: CreateBillingSessionTokenParams): string {
-  const payload: BillingSessionPayload = { workspaceId, exp: nowSeconds + ttlSeconds };
+  const payload: BillingSessionPayload = { workspaceId, purpose, exp: nowSeconds + ttlSeconds };
   const encodedPayload = base64UrlEncode(JSON.stringify(payload));
   const signature = createHmac("sha256", secret).update(encodedPayload).digest("hex");
   return `${encodedPayload}.${signature}`;
@@ -55,10 +71,16 @@ export function createBillingSessionToken({
 
 export type VerifyBillingSessionTokenResult =
   | { valid: true; workspaceId: string }
-  | { valid: false; reason: "malformed" | "tampered" | "expired" };
+  | { valid: false; reason: "malformed" | "tampered" | "expired" | "wrong_purpose" };
 
+/**
+ * `expectedPurpose` is required, not optional — there is no legitimate
+ * caller that wants "any purpose accepted," and making it required means
+ * a future call site can't accidentally skip this check by omission.
+ */
 export function verifyBillingSessionToken(
   token: string,
+  expectedPurpose: BillingSessionPurpose,
   secret: string,
   nowSeconds: number = Math.floor(Date.now() / 1000),
 ): VerifyBillingSessionTokenResult {
@@ -89,8 +111,18 @@ export function verifyBillingSessionToken(
   } catch {
     return { valid: false, reason: "malformed" };
   }
-  if (typeof payload.workspaceId !== "string" || payload.workspaceId.length === 0 || typeof payload.exp !== "number") {
+  if (
+    typeof payload.workspaceId !== "string" ||
+    payload.workspaceId.length === 0 ||
+    typeof payload.exp !== "number" ||
+    typeof payload.purpose !== "string" ||
+    !VALID_PURPOSES.has(payload.purpose)
+  ) {
     return { valid: false, reason: "malformed" };
+  }
+
+  if (payload.purpose !== expectedPurpose) {
+    return { valid: false, reason: "wrong_purpose" };
   }
 
   if (nowSeconds > payload.exp) {
