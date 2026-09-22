@@ -8,6 +8,8 @@ export const MANAGE_POLICIES_ACTION_ID = "manage_approval_policies";
 export const ADD_ADMINISTRATOR_ACTION_ID = "add_administrator";
 export const REMOVE_ADMINISTRATOR_ACTION_ID = "remove_administrator";
 export const CONFIGURE_POLICY_ACTION_ID = "configure_policy";
+/** M10.4: Free-only — disables an existing configured policy in place, without opening the (Pro-only) edit modal. Always allowed regardless of billing status — see configure_approval_policy's p_active=false carve-out. */
+export const DISABLE_POLICY_ACTION_ID = "disable_policy";
 /** M10.2: App Home Billing section, admin-only — see build-app-home-view.ts. */
 export const UPGRADE_TO_PRO_ACTION_ID = "upgrade_to_pro";
 /** App Home Billing section, shown only to admins of an already-Pro workspace — see build-app-home-view.ts. */

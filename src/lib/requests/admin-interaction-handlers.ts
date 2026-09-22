@@ -5,6 +5,7 @@ import { deriveBillingSessionSecret } from "../billing/billing-session-secret.ts
 import { createBillingSessionToken } from "../billing/billing-session-token.ts";
 import { isBlockedFromNewCheckout } from "../billing/duplicate-subscription-guard.ts";
 import { findWorkspaceSubscription } from "../billing/workspace-subscriptions.ts";
+import { getWorkspaceBillingState } from "../billing/workspace-entitlements.ts";
 import {
   ADD_ADMINISTRATOR_BLOCK_ID,
   ADD_ADMINISTRATOR_SELECT_ACTION_ID,
@@ -397,8 +398,11 @@ export async function handleManagePolicies(payload: AdminBlockActionsPayload, ti
   }
 
   try {
-    const summaries = await timer.time("db", "listPolicySummaries", () => listPolicySummaries(workspace.id));
-    await openView(workspace, timer, "open", triggerId, buildManagePoliciesView(summaries));
+    const [summaries, billingState] = await Promise.all([
+      timer.time("db", "listPolicySummaries", () => listPolicySummaries(workspace.id)),
+      timer.time("db", "getWorkspaceBillingState", () => getWorkspaceBillingState(workspace.id)),
+    ]);
+    await openView(workspace, timer, "open", triggerId, buildManagePoliciesView(summaries, { canManageApprovalPolicies: billingState.entitlements.canManageApprovalPolicies }));
   } catch (error) {
     console.error("Failed to open Manage Approval Policies:", error instanceof Error ? error.message : "unknown error");
     timer.ack("error");
@@ -406,6 +410,77 @@ export async function handleManagePolicies(payload: AdminBlockActionsPayload, ti
   }
 
   timer.ack("opened");
+  return ack();
+}
+
+// --- Disable Policy (Free-only path; Manage Approval Policies row; NOT trigger_id-bound — views.update on the same already-open view) ---
+
+/**
+ * M10.4: the only policy-configuration action a Free workspace is allowed
+ * to take from here — always succeeds regardless of billing status (see
+ * configure_approval_policy's p_active=false carve-out), and deliberately
+ * reuses the EXISTING stored approvers/required-approvals unchanged, so
+ * disabling can never also silently reconfigure a policy. No entitlement
+ * check here: disabling must remain possible precisely because a
+ * workspace lost Pro (see the M10.4 downgrade design notes) — this is
+ * intentionally the one policy write path with NO Pro gate, mirroring the
+ * RPC's own p_active=false carve-out. isWorkspaceAdmin() is still
+ * mandatory, same as every other admin action here.
+ */
+export async function handleDisablePolicy(payload: AdminBlockActionsPayload, timer: RequestTimer): Promise<Response> {
+  const slackTeamId = payload.team?.id;
+  const slackUserId = payload.user?.id;
+  const viewId = payload.view?.id;
+  const requestTypeId = payload.actions?.[0]?.value;
+  if (!slackTeamId || !slackUserId || !viewId || !requestTypeId) {
+    timer.ack("ignored");
+    return ack();
+  }
+
+  after(() =>
+    timer.afterTask("disablePolicy", async () => {
+      try {
+        const workspace = await getUsableInstallation(slackTeamId);
+        if (!workspace) {
+          return;
+        }
+        if (!(await isWorkspaceAdmin(workspace.id, slackUserId))) {
+          return;
+        }
+
+        const supabase = getSupabaseAdmin();
+        const { data: requestType } = await supabase.from("request_types").select("id, name, workspace_id, active").eq("id", requestTypeId).maybeSingle();
+        if (requestType && requestType.workspace_id === workspace.id) {
+          const existing = await getPolicyForRequestType(workspace.id, requestType.id);
+          if (existing) {
+            await configureApprovalPolicy({
+              workspaceId: workspace.id,
+              requestTypeId: requestType.id,
+              requiredApprovals: existing.requiredApprovals,
+              active: false,
+              approverSlackIds: existing.approverSlackIds,
+              policyName: `${requestType.name} Policy`,
+            });
+          }
+        }
+
+        const [summaries, billingState] = await Promise.all([listPolicySummaries(workspace.id), getWorkspaceBillingState(workspace.id)]);
+        const view = buildManagePoliciesView(summaries, { canManageApprovalPolicies: billingState.entitlements.canManageApprovalPolicies });
+
+        const botToken = decryptBotToken({
+          ciphertext: workspace.bot_access_token_ciphertext,
+          iv: workspace.bot_access_token_iv,
+          authTag: workspace.bot_access_token_auth_tag,
+        });
+        const client = new WebClient(botToken);
+        await client.views.update({ view_id: viewId, view } as Parameters<typeof client.views.update>[0]);
+      } catch (error) {
+        console.error("Failed to disable approval policy:", error instanceof Error ? error.message : "unknown error");
+      }
+    }),
+  );
+
+  timer.ack("accepted");
   return ack();
 }
 
@@ -432,6 +507,28 @@ export async function handleConfigurePolicyOpen(payload: AdminBlockActionsPayloa
   }
 
   try {
+    // M10.4: defense-in-depth at the Slack-handler layer, mirroring the
+    // configure_approval_policy RPC's own pro_required gate — this button
+    // never even renders for a Free workspace (see build-policy-views.ts),
+    // but a stale Manage Approval Policies view or a forged block action
+    // must still be rejected here, before ever opening the (Pro-only)
+    // edit modal. Disabling a policy is a SEPARATE action
+    // (handleDisablePolicy) with no entitlement gate — this one only ever
+    // leads to activating/reconfiguring, so it's the one that must be
+    // blocked for Free.
+    const billingState = await timer.time("db", "getWorkspaceBillingState", () => getWorkspaceBillingState(workspace.id));
+    if (!billingState.entitlements.canManageApprovalPolicies) {
+      await openView(
+        workspace,
+        timer,
+        "push",
+        triggerId,
+        buildAdminErrorView("This workspace needs ApproveGo Pro to configure approval policies. You can disable an existing saved policy without Pro."),
+      );
+      timer.ack("pro_required");
+      return ack();
+    }
+
     const supabase = getSupabaseAdmin();
     const { data: requestType } = await timer.time("db", "getRequestType", async () =>
       supabase.from("request_types").select("id, name, workspace_id, active").eq("id", requestTypeId).maybeSingle(),

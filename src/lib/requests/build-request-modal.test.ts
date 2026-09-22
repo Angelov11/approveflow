@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { buildRequestModal, REQUEST_MODAL_CALLBACK_ID, type BuildRequestModalParams } from "./build-request-modal.ts";
+import { computeEffectivePolicy } from "./compute-effective-policy.ts";
 
 interface PlainInputBlock {
   block_id: string;
@@ -267,5 +268,37 @@ test("switching from DIRECT to a policy-governed type hides the Approver picker 
 
 test("no type selected yet: Approver picker still shows by default (no policy summary to evaluate)", () => {
   const view = build();
+  assert.ok(inputBlockIds(view).includes("approver_block"));
+});
+
+// --- M10.4: Create Request UI matrix, chaining the real resolveEffectivePolicy
+// decision (computeEffectivePolicy) into the exact activePolicySummary shape
+// interactions/route.ts derives from it — not just buildRequestModal in
+// isolation, and not just computeEffectivePolicy in isolation. ---
+
+const CONFIGURED_POLICY = { approverSlackIds: ["U0GARY123"], requiredApprovals: 1 };
+
+/** Mirrors exactly what interactions/route.ts does with resolveEffectivePolicy's result before calling buildRequestModal. */
+function activePolicySummaryFor(configuredPolicy: typeof CONFIGURED_POLICY | null, canUsePolicyRouting: boolean) {
+  return computeEffectivePolicy(configuredPolicy, canUsePolicyRouting);
+}
+
+test("M10.4: Free workspace with a stored configured active policy still shows the Approver picker", () => {
+  const view = build({ selectedTypeKey: "expense_purchase", activePolicySummary: activePolicySummaryFor(CONFIGURED_POLICY, false) });
+  assert.ok(inputBlockIds(view).includes("approver_block"));
+});
+
+test("M10.4: Pro workspace with a configured active policy hides the Approver picker and shows the routing summary", () => {
+  const view = build({ selectedTypeKey: "expense_purchase", activePolicySummary: activePolicySummaryFor(CONFIGURED_POLICY, true) });
+  assert.ok(!inputBlockIds(view).includes("approver_block"));
+});
+
+test("M10.4: Pro workspace with no configured policy shows the Approver picker", () => {
+  const view = build({ selectedTypeKey: "expense_purchase", activePolicySummary: activePolicySummaryFor(null, true) });
+  assert.ok(inputBlockIds(view).includes("approver_block"));
+});
+
+test("M10.4: paused (Free capability) workspace with a stored configured policy shows the Approver picker", () => {
+  const view = build({ selectedTypeKey: "expense_purchase", activePolicySummary: activePolicySummaryFor(CONFIGURED_POLICY, false) });
   assert.ok(inputBlockIds(view).includes("approver_block"));
 });

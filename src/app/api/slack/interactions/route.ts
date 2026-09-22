@@ -11,6 +11,7 @@ import {
   handleAddAdministratorOpen,
   handleAddAdministratorSubmission,
   handleConfigurePolicyOpen,
+  handleDisablePolicy,
   handleManageAdministrators,
   handleManageBilling,
   handleManagePolicies,
@@ -18,7 +19,8 @@ import {
   handleRemoveAdministrator,
   handleUpgradeToPro,
 } from "@/lib/requests/admin-interaction-handlers";
-import { findActivePolicyForRequestType, listPolicyRecipients } from "@/lib/requests/approval-policies";
+import { listPolicyRecipients } from "@/lib/requests/approval-policies";
+import { resolveEffectivePolicy } from "@/lib/requests/resolve-effective-policy";
 import {
   ADD_ADMINISTRATOR_ACTION_ID,
   ADD_ADMINISTRATOR_CALLBACK_ID,
@@ -26,6 +28,7 @@ import {
   MANAGE_POLICIES_ACTION_ID,
   REMOVE_ADMINISTRATOR_ACTION_ID,
   CONFIGURE_POLICY_ACTION_ID,
+  DISABLE_POLICY_ACTION_ID,
   UPGRADE_TO_PRO_ACTION_ID,
   MANAGE_BILLING_ACTION_ID,
 } from "@/lib/requests/build-admin-views";
@@ -173,6 +176,9 @@ export async function POST(request: NextRequest) {
     if (actionId === CONFIGURE_POLICY_ACTION_ID) {
       return handleConfigurePolicyOpen(payload, timer);
     }
+    if (actionId === DISABLE_POLICY_ACTION_ID) {
+      return handleDisablePolicy(payload, timer);
+    }
     if (actionId === UPGRADE_TO_PRO_ACTION_ID) {
       return handleUpgradeToPro(payload, timer);
     }
@@ -266,23 +272,31 @@ async function handleRequestSubmission(payload: ViewSubmissionPayload, timer: Re
   //
   // M9: this is also the ONLY place that determines "current routing
   // truth" for this submission — the Create Request modal hides the
-  // Approver field once it believes a policy is active, but that belief
+  // Approver field once it believes a policy is EFFECTIVE, but that belief
   // can be stale by the time the requester actually submits (an admin may
-  // have disabled the policy in between). Never trust what the modal
-  // displayed: re-check the active policy fresh, right here.
+  // have disabled the policy, or the workspace's Pro entitlement may have
+  // changed, in between). Never trust what the modal displayed: re-check
+  // the effective policy fresh, right here.
   //
-  // Case A: an active policy exists → POLICY routing. A manually-selected
-  // approver, if the (stale) modal happened to still collect one, is
-  // resolved for validity but deliberately NOT persisted as though they
-  // were responsible for the request — company policy takes precedence.
+  // M10.4: "effective" is deliberately not the same as "configured
+  // active" — resolveEffectivePolicy additionally requires the workspace's
+  // current canUsePolicyRouting capability (Free workspaces never get
+  // POLICY routing, even for a policy an admin left configured active
+  // through a downgrade — see compute-effective-policy.ts).
   //
-  // Case B: no active policy → DIRECT routing, requiring a selected
+  // Case A: an effective policy exists → POLICY routing. A manually-
+  // selected approver, if the (stale) modal happened to still collect one,
+  // is resolved for validity but deliberately NOT persisted as though they
+  // were responsible for the request — an effective policy takes
+  // precedence.
+  //
+  // Case B: no effective policy → DIRECT routing, requiring a selected
   // approver. If the modal never collected one — because it was built
-  // believing a policy was still active — this submission is rejected
+  // believing a policy was still effective — this submission is rejected
   // with a friendly "please reopen" error rather than silently guessing an
   // approver or fabricating routing that was never actually authorized.
-  const activePolicy = await timer.time("db", "findActivePolicy", () => findActivePolicyForRequestType(workspace.id, requestType.id));
-  const routingDecision = computeRequestRoutingDecision(Boolean(activePolicy), result.data.selectedApproverSlackId);
+  const effectivePolicy = await timer.time("db", "resolveEffectivePolicy", () => resolveEffectivePolicy(workspace.id, requestType.id));
+  const routingDecision = computeRequestRoutingDecision(Boolean(effectivePolicy), result.data.selectedApproverSlackId);
 
   if (routingDecision.kind === "rejected_stale_modal") {
     timer.ack("routing_changed");
@@ -293,14 +307,14 @@ async function handleRequestSubmission(payload: ViewSubmissionPayload, timer: Re
     | { routing_type: "POLICY"; approval_policy_id: string; direct_approver_id: null; required_approval_count: number }
     | { routing_type: "DIRECT"; approval_policy_id: null; direct_approver_id: string; required_approval_count: 1 };
 
-  if (activePolicy) {
+  if (effectivePolicy) {
     // routingDecision.kind is guaranteed "policy" here — computeRequestRoutingDecision
-    // returns "policy" exactly when hasActivePolicy (Boolean(activePolicy)) was true.
+    // returns "policy" exactly when hasActivePolicy (Boolean(effectivePolicy)) was true.
     routingFields = {
       routing_type: "POLICY",
-      approval_policy_id: activePolicy.id,
+      approval_policy_id: effectivePolicy.id,
       direct_approver_id: null,
-      required_approval_count: activePolicy.required_approvals,
+      required_approval_count: effectivePolicy.required_approvals,
     };
   } else if (routingDecision.kind === "direct") {
     const directApprover = await timer.time("db", "upsertApprover", () => upsertSlackUser(workspace.id, routingDecision.approverSlackId));
@@ -358,11 +372,11 @@ async function handleRequestSubmission(payload: ViewSubmissionPayload, timer: Re
   const timing = result.data.timing;
   const expense = result.data.expense;
   const requesterSlackId = result.data.slackUserId;
-  // Guaranteed non-null whenever activePolicyId is null (DIRECT) — see the
+  // Guaranteed non-null whenever effectivePolicyId is null (DIRECT) — see the
   // routing determination above, which rejects the submission outright
   // otherwise. Only ever read in the DIRECT branch below.
   const selectedApproverSlackId = result.data.selectedApproverSlackId as string;
-  const activePolicyId = activePolicy?.id ?? null;
+  const effectivePolicyId = effectivePolicy?.id ?? null;
 
   // Best-effort notification, deferred until after the response is sent —
   // a Slack delivery failure (or slowness) here can't roll back or delay
@@ -380,8 +394,8 @@ async function handleRequestSubmission(payload: ViewSubmissionPayload, timer: Re
           console.log(`Skipping approver notification for request ${requestId}: workspace has no usable Slack installation.`);
           return;
         }
-        const recipients: NotificationRecipient[] = activePolicyId
-          ? await listPolicyRecipients(activePolicyId)
+        const recipients: NotificationRecipient[] = effectivePolicyId
+          ? await listPolicyRecipients(effectivePolicyId)
           : [{ slack_user_id: selectedApproverSlackId, display_name: null }];
 
         await notifyApprovers({
@@ -487,7 +501,7 @@ async function handleRequestTypeChanged(payload: RequestTypeChangedPayload, time
         const requestTypes = await listActiveRequestTypes(workspace.id);
         const newConfig = getRequestTypeFieldConfig(newTypeKey);
 
-        // M9: is the newly-selected type currently governed by an active
+        // M9: is the newly-selected type currently governed by an EFFECTIVE
         // policy? This is the ONLY place this is computed for rendering —
         // it never gates the initial synchronous modal-open path at all,
         // since every real submission necessarily goes through at least
@@ -495,13 +509,19 @@ async function handleRequestTypeChanged(payload: RequestTypeChangedPayload, time
         // required field with no default selection). Zero impact on the
         // trigger_id-bound open flows; this after() callback already has
         // no trigger_id budget to protect.
+        //
+        // M10.4: uses resolveEffectivePolicy, not the raw "configured
+        // active" lookup — a Free workspace with a configured active
+        // policy must still show the manual Approver picker here (see
+        // compute-effective-policy.ts). The final submission independently
+        // re-resolves this fresh regardless of what this rebuild rendered.
         const newRequestType = requestTypes.find((type) => type.key === newTypeKey);
         let activePolicySummary: { approverSlackIds: string[]; requiredApprovals: number } | null = null;
         if (newRequestType) {
-          const policy = await findActivePolicyForRequestType(workspace.id, newRequestType.id);
-          if (policy) {
-            const recipients = await listPolicyRecipients(policy.id);
-            activePolicySummary = { approverSlackIds: recipients.map((r) => r.slack_user_id), requiredApprovals: policy.required_approvals };
+          const effectivePolicy = await resolveEffectivePolicy(workspace.id, newRequestType.id);
+          if (effectivePolicy) {
+            const recipients = await listPolicyRecipients(effectivePolicy.id);
+            activePolicySummary = { approverSlackIds: recipients.map((r) => r.slack_user_id), requiredApprovals: effectivePolicy.required_approvals };
           }
         }
 
