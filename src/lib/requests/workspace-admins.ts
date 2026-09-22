@@ -53,12 +53,22 @@ export interface WorkspaceAdminSummary {
   slackUserId: string;
 }
 
-/** For rendering "Current administrators" — see build-admin-views.ts. */
+/**
+ * For rendering "Current administrators" — see build-admin-views.ts.
+ *
+ * `workspace_admins` has TWO foreign keys into `users(id)` — `user_id` (who
+ * the admin is) and `granted_by` (who granted it) — so a bare `users(...)`
+ * embed is ambiguous to PostgREST and throws ("Could not embed because more
+ * than one relationship was found for 'workspace_admins' and 'users'"),
+ * confirmed against production. Must always disambiguate via the explicit
+ * FK relationship name, matching the same pattern already used in
+ * request-views.ts for `requests`' own two FKs into `users`.
+ */
 export async function listWorkspaceAdmins(workspaceId: string): Promise<WorkspaceAdminSummary[]> {
   const supabase = getSupabaseAdmin();
   const { data, error } = await supabase
     .from("workspace_admins")
-    .select("user_id, users(slack_user_id)")
+    .select("user_id, users!workspace_admins_user_id_fkey(slack_user_id)")
     .eq("workspace_id", workspaceId)
     .order("granted_at", { ascending: true });
 
