@@ -12,7 +12,7 @@ import {
   buildAdminErrorView,
   buildManageAdministratorsView,
 } from "./build-admin-views.ts";
-import { buildBillingCheckoutModal } from "./build-billing-views.ts";
+import { buildBillingCheckoutModal, buildManageBillingModal } from "./build-billing-views.ts";
 import { buildPolicyModal, POLICY_APPROVERS_BLOCK_ID } from "./build-policy-modal.ts";
 import { buildManagePoliciesView } from "./build-policy-views.ts";
 import { serverEnv } from "../env.server.ts";
@@ -164,6 +164,57 @@ export async function handleUpgradeToPro(payload: AdminBlockActionsPayload, time
     await openView(workspace, timer, "open", triggerId, buildBillingCheckoutModal(checkoutUrl.toString()));
   } catch (error) {
     console.error("Failed to open Upgrade to Pro:", error instanceof Error ? error.message : "unknown error");
+    timer.ack("error");
+    return ack();
+  }
+
+  timer.ack("opened");
+  return ack();
+}
+
+// --- Manage Billing (App Home Billing section; trigger_id-bound) ---
+
+/**
+ * Same authorization/URL-generation shape as handleUpgradeToPro — never
+ * trusts that App Home showing "Pro" already proved anything, and never
+ * calls Paddle itself. The signed link points at /billing/manage, which
+ * creates the Paddle Customer Portal session server-side when opened.
+ */
+export async function handleManageBilling(payload: AdminBlockActionsPayload, timer: RequestTimer): Promise<Response> {
+  const slackTeamId = payload.team?.id;
+  const slackUserId = payload.user?.id;
+  const triggerId = payload.trigger_id;
+  if (!slackTeamId || !slackUserId || !triggerId) {
+    timer.ack("ignored");
+    return ack();
+  }
+
+  const workspace = await timer.time("db", "getUsableInstallation", () => getUsableInstallation(slackTeamId));
+  if (!workspace) {
+    timer.ack("not_installed");
+    return ack();
+  }
+  if (!(await timer.time("db", "isWorkspaceAdmin", () => isWorkspaceAdmin(workspace.id, slackUserId)))) {
+    timer.ack("unauthorized");
+    return ack();
+  }
+
+  try {
+    const subscription = await timer.time("db", "findWorkspaceSubscription", () => findWorkspaceSubscription(workspace.id));
+    if (!subscription) {
+      await openView(workspace, timer, "open", triggerId, buildAdminErrorView("This workspace doesn't have a billing subscription yet."));
+      timer.ack("no_subscription");
+      return ack();
+    }
+
+    const secret = deriveBillingSessionSecret(serverEnv.SLACK_CLIENT_SECRET ?? "");
+    const token = createBillingSessionToken({ workspaceId: workspace.id, secret });
+    const manageBillingUrl = new URL("/billing/manage", serverEnv.NEXT_PUBLIC_APP_URL);
+    manageBillingUrl.searchParams.set("session", token);
+
+    await openView(workspace, timer, "open", triggerId, buildManageBillingModal(manageBillingUrl.toString()));
+  } catch (error) {
+    console.error("Failed to open Manage Billing:", error instanceof Error ? error.message : "unknown error");
     timer.ack("error");
     return ack();
   }

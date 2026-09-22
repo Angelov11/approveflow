@@ -14,14 +14,14 @@ const mainStyle = {
   gap: "0.75rem",
 };
 
-const buttonStyle = {
-  marginTop: "0.5rem",
-  padding: "0.6rem 1.2rem",
+const linkButtonStyle = {
+  padding: "0.5rem 1rem",
   borderRadius: "6px",
-  background: "#4A154B",
-  color: "#fff",
-  border: "none",
+  background: "transparent",
+  color: "#9aa0a6",
+  border: "1px solid #3a3a3a",
   cursor: "pointer",
+  fontSize: "0.85rem",
 };
 
 export interface CheckoutClientProps {
@@ -30,6 +30,9 @@ export interface CheckoutClientProps {
   environment: "sandbox" | "production";
 }
 
+/** How long to wait before showing a fallback link, in case the overlay genuinely failed to render (e.g. blocked by a popup blocker) without Paddle.js firing checkout.error. */
+const FALLBACK_DELAY_MS = 4000;
+
 /**
  * Opens Paddle Checkout for a Transaction created server-side (see
  * page.tsx) — never with client-supplied items/priceId/quantity/customData.
@@ -37,10 +40,18 @@ export interface CheckoutClientProps {
  * an entitlement source: Pro is granted later by a verified Paddle webhook
  * (M10.3), not by this event firing. workspace_subscriptions is not
  * touched from this page at all.
+ *
+ * Deliberately renders no visible "Open Checkout" button/heading while
+ * loading — Paddle.Checkout.open() is called automatically the instant
+ * Paddle.js initializes, so the overlay should appear directly over a
+ * blank/near-empty page rather than a page that itself looks like a
+ * manual step. The fallback link only appears after a delay, purely as a
+ * recovery path if the overlay silently failed to render.
  */
 export function CheckoutClient({ transactionId, clientToken, environment }: CheckoutClientProps) {
   const [paddle, setPaddle] = useState<Paddle | null>(null);
   const [status, setStatus] = useState<"loading" | "ready" | "completed" | "error">("loading");
+  const [showFallback, setShowFallback] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -71,25 +82,40 @@ export function CheckoutClient({ transactionId, clientToken, environment }: Chec
     };
   }, [transactionId, clientToken, environment]);
 
+  useEffect(() => {
+    if (status !== "ready") {
+      return;
+    }
+    const timer = setTimeout(() => setShowFallback(true), FALLBACK_DELAY_MS);
+    return () => clearTimeout(timer);
+  }, [status]);
+
   function reopenCheckout() {
     paddle?.Checkout.open({ transactionId });
   }
 
+  if (status === "completed") {
+    return (
+      <main style={mainStyle}>
+        <p>Payment received. ApproveGo is confirming your subscription.</p>
+      </main>
+    );
+  }
+
+  if (status === "error") {
+    return (
+      <main style={mainStyle}>
+        <p>Something went wrong opening checkout. Please try again from Slack.</p>
+      </main>
+    );
+  }
+
   return (
     <main style={mainStyle}>
-      <h1>ApproveGo Pro</h1>
-      <p>$19/month per workspace</p>
-      {status === "completed" ? (
-        <p>Payment received. ApproveGo is confirming your subscription.</p>
-      ) : status === "error" ? (
-        <p>Something went wrong opening checkout. Please try again from Slack.</p>
-      ) : (
-        <>
-          <p>Opening secure checkout…</p>
-          <button type="button" onClick={reopenCheckout} disabled={!paddle} style={buttonStyle}>
-            Open Checkout
-          </button>
-        </>
+      {showFallback && (
+        <button type="button" onClick={reopenCheckout} style={linkButtonStyle}>
+          Checkout not showing? Click here
+        </button>
       )}
     </main>
   );

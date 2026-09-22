@@ -1,7 +1,7 @@
 import type { WebClient } from "@slack/web-api";
 
 import type { WorkspacePlan } from "../../types/billing.ts";
-import { MANAGE_ADMINISTRATORS_ACTION_ID, MANAGE_POLICIES_ACTION_ID, UPGRADE_TO_PRO_ACTION_ID } from "./build-admin-views.ts";
+import { MANAGE_ADMINISTRATORS_ACTION_ID, MANAGE_BILLING_ACTION_ID, MANAGE_POLICIES_ACTION_ID, UPGRADE_TO_PRO_ACTION_ID } from "./build-admin-views.ts";
 import { buildRequestRowBlocks, type RequestSummary } from "./build-requests-views.ts";
 import { CREATE_REQUEST_ACTION_ID, OPEN_REQUEST_CENTER_ACTION_ID, VIEW_WAITING_REQUESTS_ACTION_ID } from "./parse-requests-action.ts";
 
@@ -111,7 +111,11 @@ export function buildAppHomeView({ recentRequests, myRequestsTotalCount, waiting
     // a signed billing-session URL here; it never calls Paddle itself (see
     // handleUpgradeToPro in admin-interaction-handlers.ts).
     if (plan === "PRO") {
-      blocks.push({ type: "section", text: { type: "mrkdwn", text: "*Billing*\nPro — $19/month per workspace." } });
+      blocks.push({
+        type: "section",
+        text: { type: "mrkdwn", text: "*Billing*\nPro — $19/month per workspace." },
+        accessory: { type: "button", action_id: MANAGE_BILLING_ACTION_ID, text: { type: "plain_text", text: "Manage Billing" } },
+      });
     } else {
       blocks.push({
         type: "section",

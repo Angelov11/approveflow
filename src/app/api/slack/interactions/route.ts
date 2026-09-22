@@ -12,6 +12,7 @@ import {
   handleAddAdministratorSubmission,
   handleConfigurePolicyOpen,
   handleManageAdministrators,
+  handleManageBilling,
   handleManagePolicies,
   handlePolicySubmission,
   handleRemoveAdministrator,
@@ -26,6 +27,7 @@ import {
   REMOVE_ADMINISTRATOR_ACTION_ID,
   CONFIGURE_POLICY_ACTION_ID,
   UPGRADE_TO_PRO_ACTION_ID,
+  MANAGE_BILLING_ACTION_ID,
 } from "@/lib/requests/build-admin-views";
 import { CONFIGURE_POLICY_CALLBACK_ID } from "@/lib/requests/build-policy-modal";
 import type { PolicySubmissionPayload } from "@/lib/requests/validate-policy-submission";
@@ -173,6 +175,9 @@ export async function POST(request: NextRequest) {
     }
     if (actionId === UPGRADE_TO_PRO_ACTION_ID) {
       return handleUpgradeToPro(payload, timer);
+    }
+    if (actionId === MANAGE_BILLING_ACTION_ID) {
+      return handleManageBilling(payload, timer);
     }
     // Not one of our recognized actions — ignore safely.
     timer.ack("ignored");

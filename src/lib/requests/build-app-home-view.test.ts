@@ -141,6 +141,7 @@ test("a non-admin never sees a Billing section, even for a Pro workspace", () =>
   const text = blocksToText(view);
   assert.ok(!text.includes("Billing"));
   assert.ok(!text.includes("upgrade_to_pro"));
+  assert.ok(!text.includes("manage_billing"));
 });
 
 test("a Free admin sees the Billing section with the Upgrade to Pro button and never says 'Unlimited'", () => {
@@ -153,13 +154,16 @@ test("a Free admin sees the Billing section with the Upgrade to Pro button and n
   assert.ok(text.includes("$19/month"));
   assert.ok(text.includes("upgrade_to_pro"));
   assert.ok(text.includes("Upgrade to Pro"));
+  assert.ok(!text.includes("manage_billing"));
   assert.ok(!text.toLowerCase().includes("unlimited"));
 });
 
-test("a Pro admin sees the Billing section with no Upgrade button", () => {
+test("a Pro admin sees the Billing section with a Manage Billing button and no Upgrade button", () => {
   const view = buildAppHomeView({ recentRequests: [], myRequestsTotalCount: 0, waitingCount: 0, isAdmin: true, plan: "PRO" });
   const text = blocksToText(view);
   assert.ok(text.includes("Billing"));
   assert.ok(text.includes("Pro"));
+  assert.ok(text.includes("manage_billing"));
+  assert.ok(text.includes("Manage Billing"));
   assert.ok(!text.includes("upgrade_to_pro"));
 });
