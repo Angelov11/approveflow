@@ -56,6 +56,8 @@ import {
   VIEW_WAITING_REQUESTS_ACTION_ID,
   type RequestsNavigationPayload,
 } from "@/lib/requests/parse-requests-action";
+import { computeDecisionOpenBehavior } from "@/lib/requests/compute-decision-open-behavior";
+import type { RequestStatusForDecision } from "@/lib/requests/compute-decision-outcome";
 import { computeRequestRoutingDecision } from "@/lib/requests/compute-request-routing";
 import { getRequestDetails, listRequestsByRequester, listRequestsWaitingForApprover } from "@/lib/requests/request-views";
 import { getRequestTypeFieldConfig, remapExpenseForModeChange, remapTimingForModeChange } from "@/lib/requests/request-type-config";
@@ -588,11 +590,81 @@ async function handleOpenDecisionModal(payload: BlockActionsPayload, decision: D
     timer.ack("ignored");
     return ack();
   }
-  const { slackTeamId, triggerId, requestId, source } = parsed.data;
+  const { slackTeamId, slackUserId, triggerId, requestId, source } = parsed.data;
 
   const workspace = await timer.time("db", "getUsableInstallation", () => getUsableInstallation(slackTeamId));
   if (!workspace) {
     timer.ack("not_installed");
+    return ack();
+  }
+
+  // POST-M11-A: never open a decision modal that's doomed to fail on
+  // submit. Each policy member gets their own separate Slack DM (Slack
+  // DMs are 1:1), so once someone else's decision makes the request
+  // terminal, this approver's own message/view was never touched — read
+  // the request's CURRENT authoritative status fresh (never trust Slack
+  // payload state) and branch on it. decide_on_request() remains the sole
+  // authority for actually deciding; this is a UX pre-check only, and if
+  // it races with another decision landing in between, the unchanged
+  // submission-time check in handleDecisionSubmission still catches it.
+  const supabase = getSupabaseAdmin();
+  const { data: requestRow } = await timer.time("db", "getRequestStatusForDecisionOpen", async () =>
+    supabase.from("requests").select("status").eq("id", requestId).eq("workspace_id", workspace.id).maybeSingle(),
+  );
+  if (!requestRow) {
+    timer.ack("not_found");
+    return ack();
+  }
+
+  const openBehavior = computeDecisionOpenBehavior(requestRow.status as RequestStatusForDecision);
+  if (!openBehavior.shouldOpenModal) {
+    // Neither reflection target (chat.update on a message, views.update on
+    // a modal) needs the trigger_id, so this is safe to defer to after(),
+    // keeping the ack fast — same "no trigger_id budget to protect"
+    // reasoning as handleRemoveAdministrator.
+    const statusText = describeDecisionOutcome({
+      outcome: "already_final",
+      request_status: openBehavior.requestStatus,
+      approvals_count: null,
+      required_approvals: null,
+    });
+    after(() =>
+      timer.afterTask("reflectStaleDecision", async () => {
+        const usableWorkspace = await getUsableInstallation(slackTeamId);
+        if (!usableWorkspace) {
+          return;
+        }
+        try {
+          const botToken = decryptBotToken({
+            ciphertext: usableWorkspace.bot_access_token_ciphertext,
+            iv: usableWorkspace.bot_access_token_iv,
+            authTag: usableWorkspace.bot_access_token_auth_tag,
+          });
+          const client = new WebClient(botToken);
+          if (source.type === "message") {
+            const rebuilt = await rebuildApprovalMessageContent(usableWorkspace.id, requestId);
+            if (rebuilt) {
+              await client.chat.update(
+                {
+                  channel: source.channelId,
+                  ts: source.messageTs,
+                  text: statusText,
+                  blocks: replaceActionsWithStatus(rebuilt.blocks, statusText),
+                } as Parameters<typeof client.chat.update>[0],
+              );
+            }
+          } else {
+            const approver = await upsertSlackUser(usableWorkspace.id, slackUserId);
+            const details = await getRequestDetails(usableWorkspace.id, requestId, approver.id);
+            const view = details ? buildRequestDetailsView({ details, banner: statusText }) : buildErrorView("This request could not be found.");
+            await client.views.update({ view_id: source.viewId, view } as Parameters<typeof client.views.update>[0]);
+          }
+        } catch (error) {
+          console.error("Failed to reflect stale decision state:", error instanceof Error ? error.message : "unknown error");
+        }
+      }),
+    );
+    timer.ack("already_final");
     return ack();
   }
 
