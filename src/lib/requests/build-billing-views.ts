@@ -45,7 +45,7 @@ export function buildManageBillingModal(manageBillingUrl: string): ModalView {
     blocks: [
       {
         type: "section",
-        text: { type: "mrkdwn", text: "Continue in your browser to view invoices, update your payment method, or cancel your ApproveGo Pro subscription." },
+        text: { type: "mrkdwn", text: "Continue in your browser to update your payment method or cancel your ApproveGo Pro subscription." },
       },
       {
         type: "actions",
