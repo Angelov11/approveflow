@@ -31,12 +31,31 @@ export function parseWorkspaceIdFromCustomData(customData: unknown): string | nu
   return typeof value === "string" && UUID_PATTERN.test(value) ? value : null;
 }
 
+/**
+ * POST-M11-B2: mirrors parseWorkspaceIdFromCustomData exactly — same
+ * shape/UUID validation, same "never infer from anything else" rule.
+ * This value alone does NOT establish billing ownership: the RPC still
+ * independently validates that it resolves to a real user belonging to
+ * the exact target workspace before ever writing it (never trust
+ * custom_data as authorization by itself, even though it can only ever
+ * have been set by our own server code — see create-pro-checkout-transaction.ts).
+ */
+export function parseInitiatingUserIdFromCustomData(customData: unknown): string | null {
+  if (!customData || typeof customData !== "object") {
+    return null;
+  }
+  const value = (customData as Record<string, unknown>).initiating_user_id;
+  return typeof value === "string" && UUID_PATTERN.test(value) ? value : null;
+}
+
 export interface NormalizedSubscriptionEvent {
   providerEventId: string;
   eventType: EventName.SubscriptionCreated | EventName.SubscriptionUpdated | EventName.SubscriptionCanceled;
   occurredAt: string;
   /** null when custom_data.workspace_id is missing/malformed — never guessed. */
   workspaceId: string | null;
+  /** POST-M11-B2: null when custom_data.initiating_user_id is missing/malformed — never guessed, and NOT itself proof of ownership (the RPC re-validates workspace membership before ever writing it). */
+  initiatingUserId: string | null;
   providerSubscriptionId: string;
   providerCustomerId: string;
   /** null unless the subscription has EXACTLY ONE item — see below. */
@@ -78,6 +97,7 @@ export function normalizePaddleSubscriptionEvent(event: EventEntity): Normalized
     eventType: event.eventType,
     occurredAt: event.occurredAt,
     workspaceId: parseWorkspaceIdFromCustomData(subscription.customData),
+    initiatingUserId: parseInitiatingUserIdFromCustomData(subscription.customData),
     providerSubscriptionId: subscription.id,
     providerCustomerId: subscription.customerId,
     providerPriceId: singleItem?.price?.id ?? null,

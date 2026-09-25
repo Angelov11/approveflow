@@ -43,6 +43,7 @@ export async function processPaddleSubscriptionEvent(
     p_current_period_end: normalized.currentPeriodEnd,
     p_scheduled_change_action: normalized.scheduledChangeAction,
     p_scheduled_change_effective_at: normalized.scheduledChangeEffectiveAt,
+    p_initiating_user_id: normalized.initiatingUserId,
   });
 
   if (error) {

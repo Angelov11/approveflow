@@ -40,8 +40,10 @@ function ErrorPage({ message }: { message: string }) {
  *      Slack-side check that generated this link — that state could have
  *      changed since).
  *   4. Create the Paddle Transaction server-side, with PADDLE_PRO_PRICE_ID,
- *      quantity 1, and custom_data.workspace_id all set here — never from
- *      anything the browser sends.
+ *      quantity 1, and custom_data.workspace_id/initiating_user_id all set
+ *      here — never from anything the browser sends. initiating_user_id
+ *      comes from the verified token's userId (POST-M11-B2), not a new
+ *      trust boundary — see billing-session-token.ts.
  *
  * The browser receives only the resulting transactionId (via
  * CheckoutClient) — never the workspace UUID, never a price ID it could
@@ -75,7 +77,7 @@ export default async function BillingCheckoutPage({ searchParams }: { searchPara
 
   let transactionId: string;
   try {
-    transactionId = await createProCheckoutTransaction(workspace.id);
+    transactionId = await createProCheckoutTransaction(workspace.id, verification.userId);
   } catch (error) {
     // Never log the Paddle API key or a raw Paddle error response body — only a message.
     console.error("Failed to create Paddle checkout transaction:", error instanceof Error ? error.message : "unknown error");

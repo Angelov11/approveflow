@@ -25,6 +25,8 @@ export interface WorkspaceSubscription {
   last_event_occurred_at: string;
   created_at: string;
   updated_at: string;
+  /** POST-M11-B2: the internal users.id of the Slack admin whose server-authorized checkout produced THIS subscription — see the migration comment for the same-subscription-preserves vs new-subscription-never-inherits rule. Null for pre-existing rows and for any event whose ownership metadata never validated. */
+  billing_owner_user_id: string | null;
 }
 
 export type WorkspacePlan = "FREE" | "PRO";

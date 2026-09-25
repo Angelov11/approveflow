@@ -1,5 +1,6 @@
 import { deriveBillingSessionSecret } from "@/lib/billing/billing-session-secret";
 import { verifyBillingSessionToken } from "@/lib/billing/billing-session-token";
+import { computeBillingManagementAuthorization } from "@/lib/billing/compute-billing-management-authorization";
 import { createSubscriptionManagementUrls } from "@/lib/billing/create-customer-portal-session";
 import { findWorkspaceSubscription } from "@/lib/billing/workspace-subscriptions";
 import { serverEnv } from "@/lib/env.server";
@@ -67,6 +68,13 @@ function ErrorPage({ message }: { message: string }) {
  * API call solely for this cosmetic label isn't justified for a minimal
  * page reached only via a link generated from inside that exact
  * workspace's own Slack instance.
+ *
+ * POST-M11-B2: independently re-verifies CURRENT billing ownership from
+ * the database — never trusts that the token was valid for the owner at
+ * issuance time. A token minted for A, replayed after ownership has
+ * since changed to B, is denied here even though the token's signature,
+ * purpose, and expiry all still check out — possession of a previously
+ * issued token is deliberately not enough on its own.
  */
 export default async function BillingManagePage({ searchParams }: { searchParams: Promise<{ session?: string }> }) {
   const { session } = await searchParams;
@@ -88,6 +96,15 @@ export default async function BillingManagePage({ searchParams }: { searchParams
   const subscription = await findWorkspaceSubscription(workspace.id);
   if (!subscription) {
     return <ErrorPage message="This workspace doesn't have a billing subscription yet." />;
+  }
+
+  // POST-M11-B2 (corrected): re-check ownership fresh, right here — never
+  // trust that the token was valid for the current owner just because it
+  // verified. There is NO null-owner fallback: a subscription without a
+  // recorded, validated owner has NO administrator authorized to manage
+  // it — fail-closed, not "any admin may manage."
+  if (computeBillingManagementAuthorization(subscription.billing_owner_user_id, verification.userId) !== "authorized") {
+    return <ErrorPage message="This billing link is no longer valid. Please generate a new one from Slack." />;
   }
 
   let managementUrls;

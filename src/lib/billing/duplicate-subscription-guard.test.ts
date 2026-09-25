@@ -21,6 +21,7 @@ function subscription(status: WorkspaceSubscription["status"]): WorkspaceSubscri
     last_event_occurred_at: "2026-09-18T00:00:00.000Z",
     created_at: "2026-09-18T00:00:00.000Z",
     updated_at: "2026-09-18T00:00:00.000Z",
+    billing_owner_user_id: null,
   };
 }
 

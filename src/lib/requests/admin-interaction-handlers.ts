@@ -3,6 +3,7 @@ import { after } from "next/server";
 
 import { deriveBillingSessionSecret } from "../billing/billing-session-secret.ts";
 import { createBillingSessionToken } from "../billing/billing-session-token.ts";
+import { computeBillingManagementAuthorization } from "../billing/compute-billing-management-authorization.ts";
 import { isBlockedFromNewCheckout } from "../billing/duplicate-subscription-guard.ts";
 import { findWorkspaceSubscription } from "../billing/workspace-subscriptions.ts";
 import { getWorkspaceBillingState } from "../billing/workspace-entitlements.ts";
@@ -157,8 +158,15 @@ export async function handleUpgradeToPro(payload: AdminBlockActionsPayload, time
       return ack();
     }
 
+    // POST-M11-B2: resolve the acting admin's internal id here, from the
+    // trusted Slack payload, and carry it into the signed token — never
+    // from anything client-supplied. This is what lets the checkout page
+    // stamp Paddle custom_data with the real initiator, so the webhook
+    // can later establish billing ownership from a value it never had to
+    // trust the browser for.
+    const actingUser = await timer.time("db", "upsertActingAdmin", () => upsertSlackUser(workspace.id, slackUserId));
     const secret = deriveBillingSessionSecret(serverEnv.SLACK_CLIENT_SECRET ?? "");
-    const token = createBillingSessionToken({ workspaceId: workspace.id, purpose: "checkout", secret });
+    const token = createBillingSessionToken({ workspaceId: workspace.id, userId: actingUser.id, purpose: "checkout", secret });
     const checkoutUrl = new URL("/billing/checkout", serverEnv.NEXT_PUBLIC_APP_URL);
     checkoutUrl.searchParams.set("session", token);
 
@@ -208,8 +216,40 @@ export async function handleManageBilling(payload: AdminBlockActionsPayload, tim
       return ack();
     }
 
+    // POST-M11-B2 (corrected): resolve the acting admin's internal id,
+    // then — before ever generating a token/link — check current
+    // ownership via the pure, directly-tested predicate. There is NO
+    // null-owner fallback: a subscription without a recorded, validated
+    // owner has NO administrator authorized to manage it. This is
+    // fail-closed by design, not an oversight — see the migration's
+    // CRITICAL OWNERSHIP RULE comment for why a re-upgrade must never
+    // silently resurrect a prior owner, and why that must in turn mean
+    // "nobody" rather than "everybody" until a fresh, validated checkout
+    // establishes one.
+    const actingUser = await timer.time("db", "upsertActingAdmin", () => upsertSlackUser(workspace.id, slackUserId));
+    const authorization = computeBillingManagementAuthorization(subscription.billing_owner_user_id, actingUser.id);
+    if (authorization === "no_owner") {
+      await openView(
+        workspace,
+        timer,
+        "open",
+        triggerId,
+        buildAdminErrorView("This subscription doesn't have a recognized billing owner yet. Ask an admin to complete a checkout to establish billing ownership."),
+      );
+      timer.ack("no_billing_owner");
+      return ack();
+    }
+    if (authorization === "not_owner") {
+      const supabase = getSupabaseAdmin();
+      const { data: owner } = await supabase.from("users").select("slack_user_id").eq("id", subscription.billing_owner_user_id).maybeSingle();
+      const ownerMention = owner?.slack_user_id ? `<@${owner.slack_user_id}>` : "another administrator";
+      await openView(workspace, timer, "open", triggerId, buildAdminErrorView(`Billing is managed by ${ownerMention}.`));
+      timer.ack("not_billing_owner");
+      return ack();
+    }
+
     const secret = deriveBillingSessionSecret(serverEnv.SLACK_CLIENT_SECRET ?? "");
-    const token = createBillingSessionToken({ workspaceId: workspace.id, purpose: "manage_billing", secret });
+    const token = createBillingSessionToken({ workspaceId: workspace.id, userId: actingUser.id, purpose: "manage_billing", secret });
     const manageBillingUrl = new URL("/billing/manage", serverEnv.NEXT_PUBLIC_APP_URL);
     manageBillingUrl.searchParams.set("session", token);
 
@@ -354,7 +394,9 @@ export async function handleRemoveAdministrator(payload: AdminBlockActionsPayloa
             ? "The last administrator can't be removed."
             : outcome === "not_admin"
               ? "That person is already not an administrator."
-              : undefined;
+              : outcome === "billing_owner_blocked"
+                ? "This administrator manages the workspace's ApproveGo subscription. Cancel the subscription before removing them."
+                : undefined;
 
         const admins = await listWorkspaceAdmins(workspace.id);
         const view = buildManageAdministratorsView(admins.map((a) => ({ slackUserId: a.slackUserId })), banner);

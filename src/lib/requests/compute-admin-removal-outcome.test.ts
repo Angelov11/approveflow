@@ -42,3 +42,18 @@ test("the concurrent A-removes-B / B-removes-A race resolves safely when applied
   // End state: exactly one admin remains — zero admins was never reachable.
   assert.equal(adminsAfterFirstRemoval.length, 1);
 });
+
+// --- POST-M11-B2: billing ownership ---
+
+test("removing an admin who owns a live subscription is blocked, even though a non-owner co-admin would succeed", () => {
+  assert.equal(computeAdminRemovalOutcome(["A", "B"], "A", true), "billing_owner_blocked");
+  assert.equal(computeAdminRemovalOutcome(["A", "B"], "B", false), "removed");
+});
+
+test("last-admin protection is checked before billing ownership, and wins — ownership never weakens or bypasses it", () => {
+  assert.equal(computeAdminRemovalOutcome(["A"], "A", true), "last_admin");
+});
+
+test("a non-owner admin removal is unaffected by billing ownership entirely", () => {
+  assert.equal(computeAdminRemovalOutcome(["A", "B"], "A", false), "removed");
+});

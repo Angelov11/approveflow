@@ -3,6 +3,7 @@ import { after } from "next/server";
 import type { NextRequest } from "next/server";
 import type { SupabaseClient } from "@supabase/supabase-js";
 
+import { computeBillingManagementAuthorization } from "@/lib/billing/compute-billing-management-authorization";
 import { getWorkspaceBillingState } from "@/lib/billing/workspace-entitlements";
 import { serverEnv } from "@/lib/env.server";
 import { createRequestTimer, type RequestTimer } from "@/lib/observability/timing";
@@ -57,6 +58,11 @@ async function publishHomeView(timer: RequestTimer, slackTeamId: string, slackUs
       ]),
   );
 
+  // POST-M11-B2 (corrected): uses the exact same pure, fail-closed
+  // predicate as handleManageBilling and /billing/manage — a null owner
+  // means NO ONE may manage, never "any admin."
+  const isBillingOwner = computeBillingManagementAuthorization(billingState.billingOwnerUserId, viewer.id) === "authorized";
+
   const view = buildAppHomeView({
     recentRequests,
     myRequestsTotalCount,
@@ -64,6 +70,8 @@ async function publishHomeView(timer: RequestTimer, slackTeamId: string, slackUs
     isAdmin,
     plan: billingState.entitlements.plan,
     billingActions: billingState.billingActions,
+    isBillingOwner,
+    billingOwnerSlackUserId: billingState.billingOwnerSlackUserId,
   });
 
   const botToken = decryptBotToken({

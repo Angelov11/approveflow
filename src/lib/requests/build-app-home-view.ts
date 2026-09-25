@@ -30,6 +30,30 @@ export interface BuildAppHomeViewParams {
   plan: WorkspacePlan;
   /** M10.3: which billing buttons to show — independent of `plan`. See billing-actions.ts for why a paused/canceled workspace (plan === "FREE") can still show "Manage Billing", and canceled can show both buttons. */
   billingActions: BillingActions;
+  /**
+   * POST-M11-B2 (corrected): whether the viewer is authorized to actually
+   * use "Manage Billing" — the caller must compute this with the EXACT
+   * SAME fail-closed predicate as handleManageBilling's own pre-check:
+   * billing_owner_user_id IS NOT NULL AND equals the viewer's internal
+   * user id. There is NO null-owner exception — a subscription without a
+   * recorded owner has NO authorized manager, so this is false for every
+   * viewer until a fresh, validated checkout establishes one. This
+   * builder never reasons about ownership semantics itself; it only
+   * renders what it's told. "Upgrade Again" is NEVER gated by this — any
+   * admin may start a fresh checkout on a canceled subscription
+   * regardless of who (if anyone) owned the old one (see
+   * admin-interaction-handlers.ts).
+   */
+  isBillingOwner: boolean;
+  /**
+   * POST-M11-B2: the current owner's Slack user id, for "Managed by <@X>"
+   * copy shown to non-owner admins — null when no owner is recorded (a
+   * legacy row, or a subscription whose initiating user never validated).
+   * Never rendered as an implied responsible party when null — the
+   * caller (getWorkspaceBillingState) only resolves this lookup at all
+   * when an owner id exists. Irrelevant when isBillingOwner is true.
+   */
+  billingOwnerSlackUserId: string | null;
 }
 
 /**
@@ -45,7 +69,17 @@ export interface BuildAppHomeViewParams {
  * `origin` field) instead of pushed onto one already open. `/requests`
  * still opens this same Request Center directly, as a shortcut.
  */
-export function buildAppHomeView({ recentRequests, myRequestsTotalCount, waitingCount, isAdmin, plan, billingActions }: BuildAppHomeViewParams): HomeView {
+export function buildAppHomeView({
+  recentRequests,
+  myRequestsTotalCount,
+  waitingCount,
+  isAdmin,
+  plan,
+  billingActions,
+  isBillingOwner,
+  billingOwnerSlackUserId,
+}: BuildAppHomeViewParams): HomeView {
+  const managedByCopy = !isBillingOwner && billingOwnerSlackUserId ? `\nManaged by <@${billingOwnerSlackUserId}>.` : "";
   const blocks: unknown[] = [
     {
       type: "section",
@@ -124,27 +158,38 @@ export function buildAppHomeView({ recentRequests, myRequestsTotalCount, waiting
     // for product-feature purposes (plan === "FREE") but may still have a
     // real billing relationship worth surfacing. See billing-actions.ts.
     if (plan === "PRO") {
-      blocks.push({
-        type: "section",
-        text: { type: "mrkdwn", text: "*Billing*\nPro — $19/month per workspace." },
-        accessory: { type: "button", action_id: MANAGE_BILLING_ACTION_ID, text: { type: "plain_text", text: "Manage Billing" } },
-      });
+      blocks.push(
+        isBillingOwner
+          ? {
+              type: "section",
+              text: { type: "mrkdwn", text: "*Billing*\nPro — $19/month per workspace." },
+              accessory: { type: "button", action_id: MANAGE_BILLING_ACTION_ID, text: { type: "plain_text", text: "Manage Billing" } },
+            }
+          : {
+              type: "section",
+              text: { type: "mrkdwn", text: `*Billing*\nPro — $19/month per workspace.${managedByCopy}` },
+            },
+      );
     } else if (billingActions.canManageBilling && billingActions.canUpgrade) {
       // Canceled: checkout rules already allow resubscribing, so don't force
       // a choice between billing history and resubscribing — show both.
+      // Upgrade Again is available to every admin regardless of ownership;
+      // only Manage Billing (viewing the canceled sub's history) is gated.
       blocks.push(
         {
           type: "section",
           text: {
             type: "mrkdwn",
-            text: "*Billing*\nFree — your Pro subscription was canceled.\n\nApproval Policies are available on Pro.\n\nApproveGo Pro — $19/month per workspace",
+            text: `*Billing*\nFree — your Pro subscription was canceled.${managedByCopy}\n\nApproval Policies are available on Pro.\n\nApproveGo Pro — $19/month per workspace`,
           },
         },
         {
           type: "actions",
           block_id: "home_billing_actions",
           elements: [
-            { type: "button", action_id: MANAGE_BILLING_ACTION_ID, text: { type: "plain_text", text: "Manage Billing" } },
+            ...(isBillingOwner
+              ? [{ type: "button", action_id: MANAGE_BILLING_ACTION_ID, text: { type: "plain_text", text: "Manage Billing" } }]
+              : []),
             { type: "button", action_id: UPGRADE_TO_PRO_ACTION_ID, style: "primary", text: { type: "plain_text", text: "Upgrade Again" } },
           ],
         },
@@ -152,11 +197,18 @@ export function buildAppHomeView({ recentRequests, myRequestsTotalCount, waiting
     } else if (billingActions.canManageBilling) {
       // Paused: checkout would reject a new attempt anyway (the duplicate-
       // subscription guard blocks it), so only offer Manage Billing.
-      blocks.push({
-        type: "section",
-        text: { type: "mrkdwn", text: "*Billing*\nFree — your subscription is paused.\n\nApproval Policies are available on Pro." },
-        accessory: { type: "button", action_id: MANAGE_BILLING_ACTION_ID, text: { type: "plain_text", text: "Manage Billing" } },
-      });
+      blocks.push(
+        isBillingOwner
+          ? {
+              type: "section",
+              text: { type: "mrkdwn", text: "*Billing*\nFree — your subscription is paused.\n\nApproval Policies are available on Pro." },
+              accessory: { type: "button", action_id: MANAGE_BILLING_ACTION_ID, text: { type: "plain_text", text: "Manage Billing" } },
+            }
+          : {
+              type: "section",
+              text: { type: "mrkdwn", text: `*Billing*\nFree — your subscription is paused.${managedByCopy}\n\nApproval Policies are available on Pro.` },
+            },
+      );
     } else {
       blocks.push({
         type: "section",

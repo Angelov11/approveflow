@@ -1,10 +1,11 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 
 /**
- * Signed, short-lived token carrying a workspace_id into a billing page's
- * URL, so the raw UUID is never a trusted-by-itself URL parameter — the
- * receiving route must verify this signature, purpose, and expiry before
- * resolving the workspace at all. Same architecture as
+ * Signed, short-lived token carrying a workspace_id AND the acting
+ * admin's internal user id into a billing page's URL, so neither raw
+ * value is ever a trusted-by-itself URL parameter — the receiving route
+ * must verify this signature, purpose, and expiry before resolving
+ * anything at all. Same architecture as
  * src/lib/slack/verify-request.ts (constant-time comparison, injectable
  * `nowSeconds` for deterministic tests), applied to a signed payload
  * instead of a raw-body signature.
@@ -31,6 +32,17 @@ const VALID_PURPOSES: ReadonlySet<string> = new Set<BillingSessionPurpose>(["che
 
 interface BillingSessionPayload {
   workspaceId: string;
+  /**
+   * POST-M11-B2: the internal users.id of the Slack admin whose verified
+   * action generated this token — never client-supplied, always resolved
+   * server-side from the trusted Slack interaction envelope before
+   * calling createBillingSessionToken. Lets both /billing/checkout (to
+   * stamp Paddle custom_data with the real initiator) and /billing/manage
+   * (to independently re-check CURRENT billing_owner_user_id against the
+   * acting user, not just workspace) authorize without trusting a claim
+   * that could have gone stale since the token was issued.
+   */
+  userId: string;
   purpose: BillingSessionPurpose;
   exp: number;
 }
@@ -49,6 +61,8 @@ function base64UrlDecode(input: string): string | null {
 
 export interface CreateBillingSessionTokenParams {
   workspaceId: string;
+  /** The internal users.id of the acting Slack admin — required, never optional; see BillingSessionPayload.userId. */
+  userId: string;
   purpose: BillingSessionPurpose;
   secret: string;
   /** Injectable for deterministic tests. */
@@ -58,19 +72,20 @@ export interface CreateBillingSessionTokenParams {
 
 export function createBillingSessionToken({
   workspaceId,
+  userId,
   purpose,
   secret,
   nowSeconds = Math.floor(Date.now() / 1000),
   ttlSeconds = BILLING_SESSION_TOKEN_TTL_SECONDS,
 }: CreateBillingSessionTokenParams): string {
-  const payload: BillingSessionPayload = { workspaceId, purpose, exp: nowSeconds + ttlSeconds };
+  const payload: BillingSessionPayload = { workspaceId, userId, purpose, exp: nowSeconds + ttlSeconds };
   const encodedPayload = base64UrlEncode(JSON.stringify(payload));
   const signature = createHmac("sha256", secret).update(encodedPayload).digest("hex");
   return `${encodedPayload}.${signature}`;
 }
 
 export type VerifyBillingSessionTokenResult =
-  | { valid: true; workspaceId: string }
+  | { valid: true; workspaceId: string; userId: string }
   | { valid: false; reason: "malformed" | "tampered" | "expired" | "wrong_purpose" };
 
 /**
@@ -114,6 +129,8 @@ export function verifyBillingSessionToken(
   if (
     typeof payload.workspaceId !== "string" ||
     payload.workspaceId.length === 0 ||
+    typeof payload.userId !== "string" ||
+    payload.userId.length === 0 ||
     typeof payload.exp !== "number" ||
     typeof payload.purpose !== "string" ||
     !VALID_PURPOSES.has(payload.purpose)
@@ -129,5 +146,5 @@ export function verifyBillingSessionToken(
     return { valid: false, reason: "expired" };
   }
 
-  return { valid: true, workspaceId: payload.workspaceId };
+  return { valid: true, workspaceId: payload.workspaceId, userId: payload.userId };
 }

@@ -21,6 +21,7 @@ function subscription(overrides: Partial<WorkspaceSubscription>): WorkspaceSubsc
     last_event_occurred_at: "2026-09-01T00:00:00.000Z",
     created_at: "2026-09-01T00:00:00.000Z",
     updated_at: "2026-09-01T00:00:00.000Z",
+    billing_owner_user_id: null,
     ...overrides,
   };
 }

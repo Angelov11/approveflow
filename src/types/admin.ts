@@ -14,7 +14,7 @@ export interface InstallOrReinstallWorkspaceResult {
 }
 
 /** Return shape of the `remove_workspace_admin()` RPC. */
-export type RemoveWorkspaceAdminOutcome = "removed" | "last_admin" | "not_admin" | "workspace_not_found";
+export type RemoveWorkspaceAdminOutcome = "removed" | "last_admin" | "not_admin" | "workspace_not_found" | "billing_owner_blocked";
 
 /** Return shape of the `configure_approval_policy()` RPC. */
 export type ConfigureApprovalPolicyOutcome =
